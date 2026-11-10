@@ -2,8 +2,16 @@ name: Publish to PyPI
 
 # Trusted Publishing（OIDC）：仓库里没有任何 PyPI token / secret。
 # PyPI 侧需要先给 12 个项目各配一条 pending publisher：
-#   Owner: liwusen | Repository: liorium-framework
-#   Workflow: publish.yml | Environment: pypi（TestPyPI 用 testpypi）
+#   Owner: liwusen | Repository: liorium-framework | Workflow: publish.yml
+#   Environment: pypi-<项目名>（TestPyPI 用 testpypi-<项目名>）
+#
+# 为什么 environment 必须逐包不同：PyPI 对 GitHub publisher 的唯一性约束是
+# (owner, repo, workflow, environment) 这个四元组的**全局**唯一，同一个四元组
+# 只能登记一个项目。12 个包同 repo + 同 workflow，只能靠 environment 区分，
+# 否则第 2 个项目会报 "A pending trusted publisher matching this configuration
+# has already been registered for a different project name."
+# 参考 https://github.com/pypi/warehouse/issues/16920
+#
 # 详见 docs/PUBLISHING.md。
 
 on:
@@ -77,7 +85,9 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # 2. 发布：每个包一个 job，各自用 OIDC 换取 PyPI 的短期凭证
-  #    environment 名字必须与 PyPI Trusted Publisher 里填的一致
+  #    environment 必须逐包不同，且与 PyPI Trusted Publisher 里填的一模一样：
+  #      pypi-liorium-core / pypi-liorium-vfs / ...（TestPyPI：testpypi-liorium-core / ...）
+  #    第一次跑会自动在仓库里创建这 12 个 environment。
   # ---------------------------------------------------------------------------
   publish:
     name: publish ${{ matrix.package }}
@@ -103,7 +113,7 @@ jobs:
           - liorium-agent
           - liorium-cli
     environment:
-      name: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'pypi' }}
+      name: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'pypi' }}-${{ matrix.package }}
     permissions:
       id-token: write # OIDC：Trusted Publishing 必需
       contents: read

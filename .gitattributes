@@ -1,0 +1,9 @@
+# 统一行尾：仓库内全部用 LF（Python 源码 + docs + 脚本）。
+# Windows 上 git 默认 autocrlf 会把检出变成 CRLF，这里显式钉死，
+# 避免 diff 噪音与 "LF will be replaced by CRLF" 警告。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.webp binary
+*.db binary

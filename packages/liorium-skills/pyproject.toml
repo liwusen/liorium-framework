@@ -1,0 +1,47 @@
+[project]
+name = "liorium-skills"
+version = "0.1.0"
+description = "Liorium 技能能力包：SKILL.md 目录 + SkillsRealm"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "liwusen" }]
+keywords = ["agent", "llm", "langgraph", "realm", "framework"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "liorium-core",
+    # 挂载树要返回 VfsMount（计划 §3.3），所以能力包用 vfs 的公开面；
+    # 允许 import liorium.agent（2026-11-06 起），本包当前未使用。
+    "liorium-vfs",
+    "langchain-core>=1.6,<1.7",
+]
+
+[tool.uv.sources]
+liorium-core = { workspace = true }
+liorium-vfs = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# 命名空间包：src/liorium 下没有 __init__.py，必须用 only-include + sources
+# 让 wheel 里是 liorium/skills/... 而不是 skills/...
+only-include = ["src/liorium"]
+sources = ["src"]
+
+[project.urls]
+Homepage = "https://github.com/liwusen/liorium-framework"
+Repository = "https://github.com/liwusen/liorium-framework"
+Documentation = "https://github.com/liwusen/liorium-framework/tree/main/docs"
+Changelog = "https://github.com/liwusen/liorium-framework/releases"
+Issues = "https://github.com/liwusen/liorium-framework/issues"

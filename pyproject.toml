@@ -1,0 +1,69 @@
+# Liorium 工作区根 —— 不是包，只负责锁定 12 个包的依赖与开发工具。
+# 计划依据：docs/plans/2026-11-04-liorium-agent-core.md §2.1
+
+[project]
+name = "liorium-workspace"
+version = "0.0.0"
+description = "Liorium agent framework — uv workspace root (not published)"
+requires-python = ">=3.11"
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=1.0",
+    # 把 12 个成员包放进 dev 组：`uv sync --all-packages` 才会真的装进 .venv，
+    # 与从 PyPI 安装走同一条解析路径（而不是只靠 conftest 注入 sys.path）。
+    "liorium-core",
+    "liorium-vfs",
+    # 记忆包带 [vector] 装进 venv：向量后端测试要真的 import numpy / nano_vectordb
+    # （没有就 skip 的测试等于没测兼容性）。
+    "liorium-memory[vector]",
+    "liorium-skills",
+    "liorium-mcp",
+    "liorium-core-tool",
+    "liorium-core-tool-realm",
+    "liorium-realm-base",
+    "liorium-todo-realm",
+    "liorium-agent[all]",
+    "liorium-provider-manager[all]",
+    "liorium-cli",
+]
+
+[tool.uv.sources]
+liorium-core = { workspace = true }
+liorium-vfs = { workspace = true }
+liorium-memory = { workspace = true }
+liorium-skills = { workspace = true }
+liorium-mcp = { workspace = true }
+liorium-core-tool = { workspace = true }
+liorium-core-tool-realm = { workspace = true }
+liorium-realm-base = { workspace = true }
+liorium-todo-realm = { workspace = true }
+liorium-agent = { workspace = true }
+liorium-provider-manager = { workspace = true }
+liorium-cli = { workspace = true }
+
+[tool.pytest.ini_options]
+testpaths = ["packages", "tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+markers = [
+    "live: 需要真实模型 API（默认跳过，必须显式 -m live 运行）",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

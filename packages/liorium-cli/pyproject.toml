@@ -1,0 +1,53 @@
+[project]
+name = "liorium-cli"
+version = "0.1.0"
+description = "Liorium CLI Agent：真实模型 + 六个核心工具 + 记忆 / 技能 / 子代理"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "liwusen" }]
+keywords = ["agent", "llm", "langgraph", "realm", "framework"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "liorium-agent[core,memory-vector,skills,todo]",
+    "liorium-provider-manager[all]",
+]
+
+[project.scripts]
+liorium-cli = "liorium.cli.app:main"
+
+[tool.uv.sources]
+liorium-agent = { workspace = true }
+liorium-core = { workspace = true }
+liorium-vfs = { workspace = true }
+liorium-core-tool-realm = { workspace = true }
+liorium-memory = { workspace = true }
+liorium-skills = { workspace = true }
+liorium-todo-realm = { workspace = true }
+liorium-provider-manager = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# 命名空间包：src/liorium 下没有 __init__.py，必须用 only-include + sources
+# 让 wheel 里是 liorium/cli/... 而不是 cli/...
+only-include = ["src/liorium"]
+sources = ["src"]
+
+[project.urls]
+Homepage = "https://github.com/liwusen/liorium-framework"
+Repository = "https://github.com/liwusen/liorium-framework"
+Documentation = "https://github.com/liwusen/liorium-framework/tree/main/docs"
+Changelog = "https://github.com/liwusen/liorium-framework/releases"
+Issues = "https://github.com/liwusen/liorium-framework/issues"

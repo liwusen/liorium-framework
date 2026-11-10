@@ -1,0 +1,47 @@
+[project]
+name = "liorium-todo-realm"
+version = "0.1.0"
+description = "Liorium 待办能力包：状态化 Todo + 每 N 回合的周期提醒"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "liwusen" }]
+keywords = ["agent", "llm", "langgraph", "realm", "framework"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    # 只依赖 core（ContextItem / 错误）与 realm 契约包；**不**依赖 liorium-agent / liorium-vfs：
+    # 这个 realm 没有 VFS 挂载，正是"能力包不必背 Agent 运行时"的示范。
+    "liorium-core",
+    "liorium-realm-base",
+    "langchain-core>=1.6,<1.7",
+]
+
+[tool.uv.sources]
+liorium-core = { workspace = true }
+liorium-realm-base = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# 命名空间包：src/liorium 下没有 __init__.py，必须用 only-include + sources
+# 让 wheel 里是 liorium/todo_realm/... 而不是 todo_realm/...
+only-include = ["src/liorium"]
+sources = ["src"]
+
+[project.urls]
+Homepage = "https://github.com/liwusen/liorium-framework"
+Repository = "https://github.com/liwusen/liorium-framework"
+Documentation = "https://github.com/liwusen/liorium-framework/tree/main/docs"
+Changelog = "https://github.com/liwusen/liorium-framework/releases"
+Issues = "https://github.com/liwusen/liorium-framework/issues"

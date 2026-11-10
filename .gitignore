@@ -1,0 +1,30 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+uv.lock.bak
+*.db
+*.db-shm
+*.db-wal
+/tmp/
+.idea/
+.vscode/
+# CLI Agent 的工作目录（checkpoint / prompt / realm 状态）
+.liorium-*/
+# 本地 demo / 练习工作区，不属于框架本体
+akaSys/
+3d/
+# 本地计划 / 草稿
+__dev__/
+
+# 本地配置（含密钥）：.env / .env.local 不入库，只提交 .env.example
+.env
+.env.local
+.env.*.local
+!.env.example

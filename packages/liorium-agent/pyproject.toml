@@ -1,0 +1,83 @@
+[project]
+name = "liorium-agent"
+version = "0.1.0"
+description = "Liorium Agent 运行时：LioriumAgent / runtime / middlewares / scheduler / realms"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "liwusen" }]
+keywords = ["agent", "llm", "langgraph", "realm", "framework"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "liorium-core",
+    "liorium-vfs",
+    # realm 契约与写作 API（BaseRealm / RealmContext / JsonStateStore / @realm_tool）。
+    # 独立成包是为了让 realm 作者不背 langchain / langgraph。
+    "liorium-realm-base",
+    # 注意：Agent **不再**依赖 liorium-core-tool —— 六个核心工具由 CoreToolRealm 提供，
+    # 装不装、装哪几个由用户在 AgentSpec.realms 里决定。
+    "langchain>=1.4,<1.5",
+    "langchain-core>=1.6,<1.7",
+    "langgraph>=1.2,<1.3",
+    "langgraph-checkpoint-sqlite>=3.0,<4",
+    "aiosqlite",
+]
+
+[project.optional-dependencies]
+# 六个核心工具的能力包（read/write/edit/search/find/execute）。
+core = ["liorium-core-tool-realm"]
+memory = ["liorium-memory"]
+# 带向量检索的记忆（numpy + nano-vectordb + httpx）：``all`` 用它，普通安装不背这个包袱。
+memory-vector = ["liorium-memory[vector]"]
+skills = ["liorium-skills"]
+mcp = ["liorium-mcp"]
+todo = ["liorium-todo-realm"]
+openai = ["langchain-openai>=1.6,<2"]
+anthropic = ["langchain-anthropic>=1.7,<2"]
+google = ["langchain-google-genai>=4.4,<5"]
+all = [
+    "liorium-core-tool-realm",
+    "liorium-memory[vector]",
+    "liorium-skills",
+    "liorium-mcp",
+    "liorium-todo-realm",
+    "langchain-openai>=1.6,<2",
+    "langchain-anthropic>=1.7,<2",
+    "langchain-google-genai>=4.4,<5",
+]
+
+[tool.uv.sources]
+liorium-core = { workspace = true }
+liorium-vfs = { workspace = true }
+liorium-core-tool-realm = { workspace = true }
+liorium-realm-base = { workspace = true }
+liorium-memory = { workspace = true }
+liorium-skills = { workspace = true }
+liorium-mcp = { workspace = true }
+liorium-todo-realm = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# 命名空间包：src/liorium 下没有 __init__.py，必须用 only-include + sources
+# 让 wheel 里是 liorium/agent/... 而不是 agent/...
+only-include = ["src/liorium"]
+sources = ["src"]
+
+[project.urls]
+Homepage = "https://github.com/liwusen/liorium-framework"
+Repository = "https://github.com/liwusen/liorium-framework"
+Documentation = "https://github.com/liwusen/liorium-framework/tree/main/docs"
+Changelog = "https://github.com/liwusen/liorium-framework/releases"
+Issues = "https://github.com/liwusen/liorium-framework/issues"

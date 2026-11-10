@@ -1,0 +1,147 @@
+name: Publish to PyPI
+
+# Trusted Publishing（OIDC）：仓库里没有任何 PyPI token / secret。
+# PyPI 侧需要先给 12 个项目各配一条 pending publisher：
+#   Owner: liwusen | Repository: liorium-framework
+#   Workflow: publish.yml | Environment: pypi（TestPyPI 用 testpypi）
+# 详见 docs/PUBLISHING.md。
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "发布到哪个索引"
+        type: choice
+        required: true
+        default: pypi
+        options: [pypi, testpypi]
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. 构建：每个包一次 sdist + wheel，产物作为 artifact 交给发布 job
+  # ---------------------------------------------------------------------------
+  build:
+    name: build ${{ matrix.package }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        package:
+          - liorium-core
+          - liorium-vfs
+          - liorium-realm-base
+          - liorium-core-tool
+          - liorium-core-tool-realm
+          - liorium-memory
+          - liorium-skills
+          - liorium-mcp
+          - liorium-todo-realm
+          - liorium-provider-manager
+          - liorium-agent
+          - liorium-cli
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Check tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: uv run --no-project python scripts/check_version.py "${{ github.ref_name }}" ${{ matrix.package }}
+
+      - name: Build sdist and wheel
+        run: uv build --package ${{ matrix.package }} --out-dir dist/${{ matrix.package }}
+
+      - name: Verify the distribution metadata
+        run: uv run --no-project --with twine twine check --strict dist/${{ matrix.package }}/*
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.package }}
+          path: dist/${{ matrix.package }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 2. 发布：每个包一个 job，各自用 OIDC 换取 PyPI 的短期凭证
+  #    environment 名字必须与 PyPI Trusted Publisher 里填的一致
+  # ---------------------------------------------------------------------------
+  publish:
+    name: publish ${{ matrix.package }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        package:
+          - liorium-core
+          - liorium-vfs
+          - liorium-realm-base
+          - liorium-core-tool
+          - liorium-core-tool-realm
+          - liorium-memory
+          - liorium-skills
+          - liorium-mcp
+          - liorium-todo-realm
+          - liorium-provider-manager
+          - liorium-agent
+          - liorium-cli
+    environment:
+      name: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'pypi' }}
+    permissions:
+      id-token: write # OIDC：Trusted Publishing 必需
+      contents: read
+    steps:
+      - name: Download the built distributions
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-${{ matrix.package }}
+          path: dist
+
+      - name: Publish ${{ matrix.package }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          repository-url: ${{ github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi' && 'https://test.pypi.org/legacy/' || 'https://upload.pypi.org/legacy/' }}
+          attestations: true
+          print-hash: true
+          # 允许重跑：同版本已存在时跳过，而不是让整个 release 变红
+          skip-existing: true
+
+  # ---------------------------------------------------------------------------
+  # 3. 收尾：给 GitHub Release 附上全部产物
+  # ---------------------------------------------------------------------------
+  release:
+    name: attach distributions to the GitHub release
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download every artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Upload to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

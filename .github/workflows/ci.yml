@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Sync workspace
+        run: uv sync --all-packages --all-extras
+
+      - name: Run tests
+        run: uv run pytest -q -p no:cacheprovider
+
+  build:
+    name: build every package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Check tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: uv run --no-project python scripts/check_version.py "${{ github.ref_name }}" --all
+
+      - name: Build sdist + wheel for all 12 packages
+        run: uv build --all-packages --out-dir dist
+
+      - name: Verify the distribution metadata
+        run: uv run --no-project --with twine twine check --strict dist/*
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-all
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7

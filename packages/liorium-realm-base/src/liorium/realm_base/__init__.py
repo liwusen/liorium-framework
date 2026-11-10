@@ -1,7 +1,7 @@
 """``liorium.realm_base`` —— realm 契约与写作 API。
 
-刻意**不**依赖 langchain / langgraph：写一个 realm 只需要 ``liorium-core`` + ``liorium-vfs``；
-用 ``@realm_tool`` 提供工具时再装 ``liorium-realm-base[tools]``（langchain-core）。
+刻意**不**依赖 langchain / langgraph：写一个 realm 只需要 ``liorium.core`` + ``liorium.vfs``；
+用 ``@realm_tool`` 提供工具时才碰 langchain-core（基础依赖，``pip install liorium`` 自带）。
 
 - 契约：``Realm`` / ``BaseRealm`` / ``RealmContext`` / ``TurnInfo``
 - 状态：``JsonStateStore`` / ``RealmTaskScope``

@@ -3,7 +3,7 @@
 **本模块 import 期不依赖 langchain**：装饰器只往函数上打标记，真正构建
 ``StructuredTool`` 发生在 :func:`build_realm_tools`（且只在确有标记方法时才 import
 ``langchain_core.tools``）。这样"只提供 VFS 挂载 + 周期上下文的 realm"不必安装
-langchain；要用工具的 realm 装 ``liorium-realm-base[tools]`` 即可。
+langchain；langchain-core 是基础依赖，跟着 ``pip install liorium`` 一起装好。
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ def build_realm_tools(instance: Any) -> list[Any]:
     except ImportError as exc:  # pragma: no cover - 只在没装 langchain 时触发
         raise RealmError(
             "realm 用了 @realm_tool，但没有安装 langchain-core："
-            "pip install 'liorium-realm-base[tools]'"
+            "pip install 'liorium'（langchain-core 是基础依赖）"
         ) from exc
 
     built: list[Any] = []

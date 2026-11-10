@@ -1,17 +1,20 @@
 name: Publish to PyPI
 
 # Trusted Publishing（OIDC）：仓库里没有任何 PyPI token / secret。
-# PyPI 侧需要先给 12 个项目各配一条 pending publisher：
-#   Owner: liwusen | Repository: liorium-framework | Workflow: publish.yml
-#   Environment: pypi-<项目名>（TestPyPI 用 testpypi-<项目名>）
 #
-# 为什么 environment 必须逐包不同：PyPI 对 GitHub publisher 的唯一性约束是
-# (owner, repo, workflow, environment) 这个四元组的**全局**唯一，同一个四元组
-# 只能登记一个项目。12 个包同 repo + 同 workflow，只能靠 environment 区分，
-# 否则第 2 个项目会报 "A pending trusted publisher matching this configuration
-# has already been registered for a different project name."
-# 参考 https://github.com/pypi/warehouse/issues/16920
+# 发布单元只有一个发行版 liorium —— 12 个模块（core / vfs / realm_base / core_tool /
+# core_tool_realm / agent / memory / skills / mcp / todo_realm / provider / cli）的源码由
+# 根 pyproject.toml 的 force-include 打进同一个 wheel。因此 PyPI 侧只需要**一条**配置：
 #
+#   PyPI Project Name: liorium
+#   Owner:            liwusen
+#   Repository name:  liorium-framework
+#   Workflow name:    publish.yml
+#   Environment name: pypi      （TestPyPI 用 testpypi）
+#
+# 历史提醒：以前是 12 个包各自发布，而 PyPI 对 GitHub publisher 的唯一性约束是
+# (owner, repo, workflow, environment) 四元组全局唯一，所以 12 个包必须挤在 12 个不同的
+# environment 里。改成单一发行版后这个约束不再是问题。
 # 详见 docs/PUBLISHING.md。
 
 on:
@@ -35,27 +38,11 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. 构建：每个包一次 sdist + wheel，产物作为 artifact 交给发布 job
+  # 1. 构建：一个 sdist + 一个 wheel（内含 12 个模块）
   # ---------------------------------------------------------------------------
   build:
-    name: build ${{ matrix.package }}
+    name: build liorium
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: true
-      matrix:
-        package:
-          - liorium-core
-          - liorium-vfs
-          - liorium-realm-base
-          - liorium-core-tool
-          - liorium-core-tool-realm
-          - liorium-memory
-          - liorium-skills
-          - liorium-mcp
-          - liorium-todo-realm
-          - liorium-provider-manager
-          - liorium-agent
-          - liorium-cli
     steps:
       - uses: actions/checkout@v4
 
@@ -65,55 +52,38 @@ jobs:
           python-version: "3.11"
           enable-cache: true
 
-      - name: Check tag matches the package version
+      - name: Check tag matches the distribution version
         if: startsWith(github.ref, 'refs/tags/v')
-        run: uv run --no-project python scripts/check_version.py "${{ github.ref_name }}" ${{ matrix.package }}
+        run: uv run --no-project python scripts/check_version.py "${{ github.ref_name }}" --all
 
       - name: Build sdist and wheel
-        run: uv build --package ${{ matrix.package }} --out-dir dist/${{ matrix.package }}
+        run: uv build --out-dir dist
 
       - name: Verify the distribution metadata
-        run: uv run --no-project --with twine twine check --strict dist/${{ matrix.package }}/*
+        run: uv run --no-project --with twine twine check --strict dist/*
+
+      - name: Verify the wheel ships all 12 modules
+        run: uv run --no-project python scripts/check_wheel.py dist/*.whl
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dist-${{ matrix.package }}
-          path: dist/${{ matrix.package }}/
+          name: dist
+          path: dist/
           if-no-files-found: error
           retention-days: 7
 
   # ---------------------------------------------------------------------------
-  # 2. 发布：每个包一个 job，各自用 OIDC 换取 PyPI 的短期凭证
-  #    environment 必须逐包不同，且与 PyPI Trusted Publisher 里填的一模一样：
-  #      pypi-liorium-core / pypi-liorium-vfs / ...（TestPyPI：testpypi-liorium-core / ...）
-  #    第一次跑会自动在仓库里创建这 12 个 environment。
+  # 2. 发布：OIDC 换取 PyPI 的短期凭证（environment 名字必须与 PyPI 里填的一致）
   # ---------------------------------------------------------------------------
   publish:
-    name: publish ${{ matrix.package }}
+    name: publish liorium
     needs: build
-    # build-only：只验证 12 个包能构建 + 元数据合法，不碰 PyPI
+    # build-only：只验证能构建 + 元数据合法 + 12 个模块齐全，不碰 PyPI
     if: github.event_name != 'workflow_dispatch' || inputs.target != 'build-only'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      max-parallel: 1
-      matrix:
-        package:
-          - liorium-core
-          - liorium-vfs
-          - liorium-realm-base
-          - liorium-core-tool
-          - liorium-core-tool-realm
-          - liorium-memory
-          - liorium-skills
-          - liorium-mcp
-          - liorium-todo-realm
-          - liorium-provider-manager
-          - liorium-agent
-          - liorium-cli
     environment:
-      name: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'pypi' }}-${{ matrix.package }}
+      name: ${{ github.event_name == 'workflow_dispatch' && inputs.target || 'pypi' }}
     permissions:
       id-token: write # OIDC：Trusted Publishing 必需
       contents: read
@@ -121,10 +91,10 @@ jobs:
       - name: Download the built distributions
         uses: actions/download-artifact@v4
         with:
-          name: dist-${{ matrix.package }}
+          name: dist
           path: dist
 
-      - name: Publish ${{ matrix.package }}
+      - name: Publish liorium
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
@@ -135,7 +105,7 @@ jobs:
           skip-existing: true
 
   # ---------------------------------------------------------------------------
-  # 3. 收尾：给 GitHub Release 附上全部产物
+  # 3. 收尾：给 GitHub Release 附上产物
   # ---------------------------------------------------------------------------
   release:
     name: attach distributions to the GitHub release
@@ -145,12 +115,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download every artifact
+      - name: Download the artifact
         uses: actions/download-artifact@v4
         with:
-          pattern: dist-*
+          name: dist
           path: dist
-          merge-multiple: true
 
       - name: Upload to the release
         uses: softprops/action-gh-release@v2

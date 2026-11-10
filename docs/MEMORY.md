@@ -267,7 +267,7 @@ realm_factory = lambda spec: MemoryRealm(
 
 | 现象 | 原因 / 处理 |
 |---|---|
-| 启动日志说「语义检索不可用」 | 没装 extra：`uv pip install 'liorium-memory[vector]'`（numpy + nano-vectordb + httpx） |
+| 启动日志说「语义检索不可用」 | 没装 extra：`pip install 'liorium[vector]'`（numpy + nano-vectordb + httpx） |
 | `embedding 维度不对: 期望 1536` | 服务端不支持 `dimensions` 参数。`.vdb` 格式要求 1536，换维度 = 断兼容（要么换服务，要么改 `EMBED_DIM` 并清空 `index/`） |
 | `向量索引维度不兼容: 文件是 1536，本后端是 …` | 换了 embedding 模型。删掉 `index/chunks.vdb`（或换 `--memory-dir`）重来 |
 | 写完记忆立刻 `memory_search` 搜不到语义结果 | 向量是**最终一致**的（后台队列，几百毫秒~几秒）；关键词结果立刻就有。要立刻齐可用 `realm.drain_index()` |

@@ -1,12 +1,103 @@
-# Liorium 工作区根 —— 不是包，只负责锁定 12 个包的依赖与开发工具。
-# 计划依据：docs/plans/2026-11-04-liorium-agent-core.md §2.1
-
 [project]
-name = "liorium-workspace"
-version = "0.0.0"
-description = "Liorium agent framework — uv workspace root (not published)"
+name = "liorium"
+version = "0.1.0"
+description = "Liorium：可嵌入的 LLM Agent 框架 —— 一个发行版内含 core / vfs / realm / agent / memory / skills / mcp / todo / provider / cli 全部 10 个模块"
+readme = "README.md"
 requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "liwusen" }]
+keywords = ["agent", "llm", "langgraph", "langchain", "realm", "mcp", "framework"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# 一个发行版 = 一份依赖。所有代码（core/vfs/agent/memory/skills/mcp/todo/provider/cli）
+# 都在 wheel 里，这里的依赖是「跑得起来的最小集合」；能力型第三方库走 extra。
+dependencies = [
+    "langchain>=1.4,<1.5",
+    "langchain-core>=1.6,<1.7",
+    "langgraph>=1.2,<1.3",
+    "langgraph-checkpoint-sqlite>=3.0,<4",
+    "aiosqlite",
+    "pydantic>=2.7,<3",
+    "httpx>=0.27,<1",
+    "pyyaml>=6",
+]
 
+[project.optional-dependencies]
+# MCP 客户端（liorium.mcp）：装了这个才有 stdio/sse/http 默认客户端。
+mcp = ["mcp>=1.28,<2"]
+# 语义检索（liorium.memory 的 NanoVectorBackend）：不装就退回纯 FTS5 关键词检索。
+vector = [
+    # pin 到 0.0.4.3：nano 的落盘格式没有版本号，升级可能改 ``matrix`` 编码。
+    "nano-vectordb==0.0.4.3",
+    "numpy>=2",
+]
+openai = ["langchain-openai>=1.6,<2"]
+anthropic = ["langchain-anthropic>=1.7,<2"]
+google = ["langchain-google-genai>=4.4,<5"]
+# 图片输入（liorium.agent 的 mm_bridge）：用到才 import，不装不影响纯文本。
+images = ["pillow>=10"]
+# 全家桶：CLI 想要「所有 provider + 向量记忆 + MCP + 图片」就装这个。
+all = [
+    "mcp>=1.28,<2",
+    "nano-vectordb==0.0.4.3",
+    "numpy>=2",
+    "langchain-openai>=1.6,<2",
+    "langchain-anthropic>=1.7,<2",
+    "langchain-google-genai>=4.4,<5",
+    "pillow>=10",
+]
+
+[project.scripts]
+liorium-cli = "liorium.cli.app:main"
+
+[project.urls]
+Homepage = "https://github.com/liwusen/liorium-framework"
+Repository = "https://github.com/liwusen/liorium-framework"
+Documentation = "https://github.com/liwusen/liorium-framework/tree/main/docs"
+Changelog = "https://github.com/liwusen/liorium-framework/releases"
+Issues = "https://github.com/liwusen/liorium-framework/issues"
+
+# ---------------------------------------------------------------------------
+# 构建：一个发行版，12 个包的源码树全部打进同一个 wheel。
+# 源码仍按 packages/<包名>/src/liorium/<子包> 分目录维护（便于约束依赖方向、单测隔离），
+# 但**只发布**根项目 liorium，不再单独发布 liorium-*。
+# ---------------------------------------------------------------------------
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# wheel 的「自有」内容只有这一个：liorium/__init__.py（版本号与包文档）。
+# 12 个模块由下面的 force-include 注入（每个包自己的 src/liorium/<子包> → liorium/<子包>），
+# 所以 wheel 内是 liorium/{core,vfs,agent,...}，import 路径与开发时完全一致。
+#
+# force-include 只挂在 wheel 上：sdist 保留 packages/* 的原始目录结构，
+# 这样「sdist → wheel」二次构建时这些路径依然存在（否则会报 Forced include not found）。
+only-include = ["src/liorium"]
+sources = ["src"]
+force-include = { "packages/liorium-core/src/liorium/core" = "liorium/core", "packages/liorium-vfs/src/liorium/vfs" = "liorium/vfs", "packages/liorium-realm-base/src/liorium/realm_base" = "liorium/realm_base", "packages/liorium-core-tool/src/liorium/core_tool" = "liorium/core_tool", "packages/liorium-core-tool-realm/src/liorium/core_tool_realm" = "liorium/core_tool_realm", "packages/liorium-memory/src/liorium/memory" = "liorium/memory", "packages/liorium-skills/src/liorium/skills" = "liorium/skills", "packages/liorium-mcp/src/liorium/mcp" = "liorium/mcp", "packages/liorium-todo-realm/src/liorium/todo_realm" = "liorium/todo_realm", "packages/liorium-provider-manager/src/liorium/provider" = "liorium/provider", "packages/liorium-agent/src/liorium/agent" = "liorium/agent", "packages/liorium-cli/src/liorium/cli" = "liorium/cli" }
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/pyproject.toml",
+    "/README.md",
+    "/LICENSE",
+    "/src/liorium/**/*.py",
+    "/packages/*/src/liorium/**/*.py",
+]
+
+# ---------------------------------------------------------------------------
+# 工作区：12 个包仍然是 workspace 成员，只为开发期各自 editable 安装 / 各自依赖解析。
+# 根项目本身不在开发环境里安装（package = false），避免与成员包的 liorium.* 重复。
+# ---------------------------------------------------------------------------
 [tool.uv]
 package = false
 
@@ -51,6 +142,8 @@ liorium-cli = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["packages", "tests"]
+# live 标记的用例要真实网络 / 真实模型 key，默认不跑（`pytest -m live` 显式打开）。
+addopts = "-m 'not live'"
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 filterwarnings = [

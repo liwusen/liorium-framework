@@ -1,18 +1,20 @@
 # Liorium
 
-**Liorium** 是一个可独立发布的 Agent 框架：12 个命名空间包、realm 扩展机制、可热重载的运行时、
-流式事件出口、混合记忆、技能库、MCP 与子代理，全部只依赖标准库与公开的 LangChain / LangGraph。
+**Liorium** 是一个可独立发布的 Agent 框架：**一个发行版 `liorium`，内含 12 个模块**、
+realm 扩展机制、可热重载的运行时、流式事件出口、混合记忆、技能库、MCP 与子代理，
+全部只依赖标准库与公开的 LangChain / LangGraph。
 
-- 包族：`liorium-core` / `liorium-vfs` / `liorium-realm-base` / `liorium-core-tool` /
-  `liorium-core-tool-realm` / `liorium-agent` / `liorium-memory` / `liorium-skills` /
-  `liorium-mcp` / `liorium-todo-realm` / `liorium-provider-manager` / `liorium-cli`
-- 安装：`pip install liorium-cli`（或只要运行时：`pip install "liorium-agent[all]"`）
+- 模块：`liorium.core` / `liorium.vfs` / `liorium.realm_base` / `liorium.core_tool` /
+  `liorium.core_tool_realm` / `liorium.agent` / `liorium.memory` / `liorium.skills` /
+  `liorium.mcp` / `liorium.todo_realm` / `liorium.provider` / `liorium.cli`
+- 安装：`pip install "liorium[all]"`（全家桶：MCP + 向量记忆 + 三家 provider 适配 + 图片）；
+  只要框架运行时用 `pip install liorium`；单独选装见下
 - 仓库：<https://github.com/liwusen/liorium-framework>
 
 架构决策记录：[`docs/plans/2026-11-04-liorium-agent-core.md`](docs/plans/2026-11-04-liorium-agent-core.md)。
 实现与决策冲突时以决策记录为准；要改结论先改决策记录。
 
-当前状态：**Phase 1（v1.0）骨架 + Phase 2（v1.1）能力包完成** —— 12 个包的 workspace、
+当前状态：**Phase 1（v1.0）骨架 + Phase 2（v1.1）能力包完成** —— 12 个模块的 workspace、
 6 个核心工具、Agent 运行时（`run/inject/interrupt/apply`）、基座中间件链、realm 系统、
 子代理、checkpoint 兼容旧库；`liorium-memory` / `liorium-skills` / `liorium-mcp` / `liorium-todo-realm`
 四个 realm 能力包（挂载 + 工具 + 状态 + prompt 片段），以及 `conversation` scope、profile 语法糖、
@@ -23,7 +25,13 @@ MCP mark-dirty reconcile、realm 的**第五拍**（`context_items()` 按回合�
 逐条验收证据见 [`docs/design/ACCEPTANCE.md`](docs/design/ACCEPTANCE.md)，模块地图见
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
-## 包族（命名空间包 `liorium.*`，12 个）
+## 模块（`liorium.*`，12 个，同一个发行版）
+
+> **发布形态**：PyPI 上只有一个 `liorium`（12 个模块的源码由根 `pyproject.toml` 的
+> `force-include` 打进同一个 wheel），安装时的分档只有 **extras**：
+> `liorium[all]` / `[mcp]` / `[vector]` / `[openai]` / `[anthropic]` / `[google]` / `[images]`。
+> 下表描述的是 workspace 里的模块边界（开发期 `uv sync --all-packages` 逐个装成可编辑包，
+> 架构守卫按这些边界检查依赖方向）；它们**不再**各自发到 PyPI。
 
 | 包 | 职责 | 依赖 |
 |---|---|---|
@@ -40,7 +48,8 @@ MCP mark-dirty reconcile、realm 的**第五拍**（`context_items()` 按回合�
 | `liorium-agent` | LioriumAgent / runtime / middlewares / scheduler / realms | core, vfs, realm-base, langchain, langgraph |
 | `liorium-cli` | 官方命令行 Agent：REPL / 斜杠命令 / 子代理事件查看 | liorium-agent[core,memory-vector,skills,todo], liorium-provider-manager[all] |
 
-依赖方向：`core` 是叶子；`agent` 对 realm 能力包走 extra（`[core]` `[memory]` `[skills]` `[mcp]` `[todo]`）。
+依赖方向：`core` 是叶子；开发期 `liorium-agent` 对 realm 模块走 extra（`[core]` `[memory]`
+`[skills]` `[mcp]` `[todo]`），发布版这些模块都已在 wheel 里、由上面的 extras 只控制第三方库。
 **Agent 不依赖 `liorium-core-tool`**：六个核心工具由 `liorium-core-tool-realm` 提供，装不装、装哪几个
 由用户在 `AgentSpec.realms` / `toolsets` 里决定。
 **realm 契约与写作 API 在 `liorium-realm-base`**（2026-11-07 从 agent 搬出）：写一个 realm
@@ -69,7 +78,7 @@ import `liorium.agent` 或更轻的 `liorium.realm_base`（2026-11-06 起）；`
 | 文档 | 内容 |
 |---|---|
 | [`docs/GUIDE.md`](docs/GUIDE.md) | 从零到跑起来：安装、最小 Agent、事件表、中断/注入、压缩与成本、多 Agent 并发（每段都能跑） |
-| [`docs/API.md`](docs/API.md) | 12 个包全部公开名字的签名、默认值、异常与不变量 |
+| [`docs/API.md`](docs/API.md) | 12 个模块全部公开名字的签名、默认值、异常与不变量 |
 | [`docs/EXTENDING.md`](docs/EXTENDING.md) | 写自定义 Realm / Middleware / 调度参数（`priority` / `FLAG`）/ model_factory / 工具，以及常见坑 |
 | [`docs/MEMORY.md`](docs/MEMORY.md) | 记忆子系统：磁盘布局、检索流水线、内存预算、设计取舍 |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 实现视角的模块地图与一个回合的时序 |
@@ -135,14 +144,15 @@ asyncio.run(main())
 - 清空对话 = `await agent.reset_dialog()`（纯状态写入，不调模型；同时清空
   `state_scope="conversation"` 的 realm 状态）。
 
-## CLI Agent（`liorium-cli` 包）
+## CLI Agent（`liorium.cli`）
 
 `packages/liorium-cli` 是官方命令行 Agent（不是示例）：realm 能力包（**核心工具**
 `read/write/edit/search/find/execute`、**长期记忆（`memories://`）**、**技能库（`skills://`）**、
 **待办**、**子代理**）、流式渲染、`/model` 热切换、`inject`、`clear`、Ctrl+C 中断。模块路径
-`liorium.cli`，入口 `liorium-cli`（等价 `python -m liorium.cli`）。
+`liorium.cli`，入口 `liorium-cli`（等价 `python -m liorium.cli`）。发布版里 CLI 就在 `liorium`
+同一个 wheel 中，装 `pip install "liorium[all]"` 即可，不需要额外的 `liorium-cli` 包。
 
-六个核心工具现在是 `core` realm（`liorium-core-tool-realm`）：CLI 默认装上，`--no-core-tools`
+六个核心工具现在是 `core` realm（`liorium.core_tool_realm`）：CLI 默认装上，`--no-core-tools`
 则不装（Agent 就一个工具都没有），`--tools read,find` 只装子集。
 
 ```powershell
@@ -205,8 +215,9 @@ Provider 管理（四种 API 格式、思考参数、models.dev 识别、模型�
 - realm 开关：`/realm` 列出每个 realm 的状态 / 工具数 / 挂载 / 上下文节奏，`/realm <id>` 看详情；
   `/realm disable <id>` 与 `/realm enable <id>` 运行期开或关（工具、挂载、prompt 段一起撤下或恢复，
   `epoch` +1，不需要重启 CLI）。装配集合仍由启动参数决定：`--no-memory` 这类要重启才会变。
-- 记忆 / 技能 / 待办在 `liorium-cli` 里是默认依赖；库使用者可以只装 `liorium-agent[core]` /
-  `[memory]` / `[skills]`，缺包时 CLI 打印一条提示并降级，核心工具（`core` realm）照常可用。
+- 记忆 / 技能 / 待办在发布版里都在同一个 `liorium` wheel 中，CLI 默认全部装配；
+  只有第三方库需要按需选装（`liorium[vector]` / `[mcp]` / `[openai]` …），
+  缺这些库时 CLI 打印一条提示并降级，核心工具（`core` realm）照常可用。
 
 工作区默认是当前目录（`read/write/edit/search/find/execute` 的相对路径基准），
 Agent 根目录（prompt + checkpoint + 记忆库 + 技能目录 + 子代理）默认是
@@ -214,9 +225,9 @@ Agent 根目录（prompt + checkpoint + 记忆库 + 技能目录 + 子代理）�
 `--workspace/--inbox/--system/--memory-dir/--skills-dir` 改。Ctrl+C 在生成中是
 **中断当回合**（不退出），在提示符下是退出。
 
-## realm 能力包（v1.1）
+## realm 能力模块（v1.1）
 
-四个 realm 能力包都是"工具 + 状态 + `prompt_fragment()`"（前三个还有 VFS 挂载），按需装：
+四个 realm 能力模块都是"工具 + 状态 + `prompt_fragment()`"（前三个还有 VFS 挂载）：
 
 ```python
 from liorium.agent import AgentSpec, RealmSpec, LioriumAgent
@@ -313,7 +324,7 @@ python examples/multi_agent.py -p "用一句话介绍 Liorium" --concurrency 1
 ## 开发
 
 ```powershell
-uv sync --all-packages --all-extras     # 建 .venv 并装好 12 个包（可编辑）
+uv sync --all-packages --all-extras     # 建 .venv 并装好 12 个模块（可编辑包）
 uv run pytest -q                        # 全量测试（含架构守卫）
 
 # 本机 PyPI 慢时用离线模式
@@ -338,7 +349,8 @@ $env:OPENCODE_GO_MODEL = "deepseek-v4.1-flash"
 ```
 
 发布走 GitHub Actions 的 **Trusted Publishing**（OIDC，无需任何 API token）：
-推一个 `v*` tag 即可把 12 个包发到 PyPI，详见 [`docs/PUBLISHING.md`](docs/PUBLISHING.md)。
+推一个 `v*` tag 即可把 `liorium` 发到 PyPI（12 个模块在同一个 wheel 里，PyPI 侧只需 1 条
+pending publisher，见 [`docs/PUBLISHING.md`](docs/PUBLISHING.md)）。
 
 ## 不变量（违反即跑偏，计划 §8）
 

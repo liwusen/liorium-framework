@@ -544,7 +544,7 @@ async def test_missing_skill_package_degrades(tmp_path: Path, monkeypatch, capsy
         await session.close()
     out = capsys.readouterr().out
     assert "skills 能力不可用" in out
-    assert "liorium-agent[skills]" in out
+    assert "pip install 'liorium'" in out
     assert "技能功能未启用" in out
 
 

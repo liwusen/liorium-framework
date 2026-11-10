@@ -9,7 +9,7 @@
 ```powershell
 git clone https://github.com/liwusen/liorium-framework.git
 cd liorium-framework
-# 建 .venv 并安装 12 个包（可编辑模式）+ 全部 extra
+# 建 .venv 并安装 12 个模块（可编辑模式）+ 全部 extra
 uv sync --all-packages --all-extras
 
 # 本机 PyPI 慢时用离线模式（依赖已缓存过才行）
@@ -19,10 +19,19 @@ uv sync --all-packages --all-extras --offline
 .\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider
 ```
 
-Python 3.11+。12 个包都是**命名空间包**：每个包只有 `src/liorium/<sub>/__init__.py`，
-`src/liorium/` 下没有 `__init__.py`（`tests/test_architecture.py` 会检查）。
+Python 3.11+。开发期 12 个模块各自是可编辑安装的**命名空间包**：每个模块只有
+`packages/<包>/src/liorium/<sub>/__init__.py`，那些 `src/liorium/` 下没有 `__init__.py`
+（`tests/test_architecture.py` 会检查）；发布版则合并成**一个** `liorium` 发行版
+（`pip install "liorium[all]"`），导入前缀与下表完全一致。
 
-| 包 | 导入前缀 | 职责 |
+从 PyPI 安装（不克隆仓库）：
+
+```powershell
+pip install "liorium[all]"      # 全家桶；只要框架运行时用 pip install liorium
+liorium-cli --help
+```
+
+| 模块（开发期 workspace 包） | 导入前缀 | 职责 |
 |---|---|---|
 | `liorium-core` | `liorium.core` | 类型 / URI / 指纹 / 日志 / 异常 / 端口（零第三方依赖） |
 | `liorium-vfs` | `liorium.vfs` | `VirtualFileSystem` / `VfsNode` / 挂载（零第三方依赖） |
@@ -182,7 +191,7 @@ def make_chat_model(label: str) -> Any:
 ```
 
 ```powershell
-uv pip install "liorium-agent[openai]"      # 或 uv sync --all-extras 已经装好
+uv pip install "liorium[openai]"      # 或 uv sync --all-extras 已经装好
 $env:LIORIUM_BASE_URL = "https://api.deepseek.com"
 $env:LIORIUM_API_KEY  = "<key>"
 .\.venv\Scripts\python.exe minimal_agent.py

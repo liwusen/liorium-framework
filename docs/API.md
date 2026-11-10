@@ -6,7 +6,9 @@
 
 约定：
 
-- 12 个包都是命名空间包：`from liorium.agent import LioriumAgent`，`liorium` 自身不是包；
+- 12 个模块共用同一个顶层包名：`from liorium.agent import LioriumAgent`。开发期这 12 个目录
+  各自是可编辑安装的命名空间包；发布版把它们打进同一个 wheel，`liorium/__init__.py` 提供
+  `__version__`。两种情况下的导入路径完全一致；
 - 所有 dataclass 都是 frozen（除 `RealmContext`、`RealmRecord`、`ToolRuntime` 等运行期对象）；
 - 「不变量」是本仓库用测试钉住的行为（`tests/test_architecture.py`、`tests/test_event_contract.py` 等）。
 

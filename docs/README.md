@@ -1,15 +1,16 @@
 # Liorium 文档中心
 
-Liorium 是可独立发布的 Agent 框架：`uv` workspace、12 个命名空间包（`liorium.*`），
+Liorium 是可独立发布的 Agent 框架：`uv` workspace、12 个模块（`liorium.*`），发布时合并成
+**一个** PyPI 发行版 `liorium`。
 核心概念是 **Realm**（工具 + VFS 挂载 + 状态 + prompt 片段四件套）、**CacheEpoch**
 （缓存世代记账）、**`apply()` 差量热重载** 与 **回合边界 reconcile**。
 本页是文档入口：先按角色选一条线，需要查签名时再进 [API](API.md)。
 
 ```mermaid
 graph LR
-    root["根 README<br/>包族 / 快速开始 / 不变量"]
+    root["根 README<br/>模块表 / 快速开始 / 不变量"]
     guide["GUIDE<br/>从零到跑起来"]
-    api["API<br/>逐包签名与不变量"]
+    api["API<br/>逐模块签名与不变量"]
     ext["EXTENDING<br/>realm / 中间件 / 端口"]
     mem["MEMORY<br/>记忆子系统与设计取舍"]
     arch["ARCHITECTURE<br/>实现视角的模块地图"]
@@ -29,11 +30,11 @@ graph LR
 
 | 文档 | 一句话 |
 |---|---|
-| [根 README](../README.md) | 包族表、安装、最小 Agent 片段、CLI 用法与 10 条不变量 |
+| [根 README](../README.md) | 模块表、安装、最小 Agent 片段、CLI 用法与 10 条不变量 |
 | [GUIDE](GUIDE.md) | 安装 → 最小 Agent → 事件表 → 中断/注入 → 压缩与成本 → 多 Agent 并发，每段都能直接跑 |
-| [API](API.md) | 12 个包全部公开名字的签名、默认值、异常与不变量 |
+| [API](API.md) | 12 个模块全部公开名字的签名、默认值、异常与不变量 |
 | [MEMORY](MEMORY.md) | 记忆子系统：磁盘布局、旧接口映射、检索流水线、内存预算、偏差登记 |
-| [PUBLISHING](PUBLISHING.md) | Trusted Publishing：12 个包如何发到 PyPI |
+| [PUBLISHING](PUBLISHING.md) | Trusted Publishing：一个发行版 `liorium` 如何发到 PyPI（只需 1 条 publisher） |
 | [liorium-cli](../packages/liorium-cli/README.md) | 官方命令行 Agent：core 工具 + 记忆 + 技能 + 待办 + 子代理 + 流式渲染（工具全部来自 realm） |
 | [liorium-provider-manager](../packages/liorium-provider-manager/README.md) | Provider 管理：schema / 四种 API 格式 / 思考 / models.dev / 模型构建 |
 
@@ -64,7 +65,9 @@ graph LR
 | [plans/2026-11-07-liorium-provider-manager.md](plans/2026-11-07-liorium-provider-manager.md) | Provider 管理迁移与思考接入的决策记录 |
 | [tests/test_architecture.py](../tests/test_architecture.py) | 架构守卫：依赖方向、禁词、命名空间包约定、禁止裸 `asyncio.create_task` |
 
-各包的职责与最小示例见包 README：
+| [tests/test_distribution.py](../tests/test_distribution.py) | 发布形态守卫：force-include 覆盖 12 个模块、版本一致、根项目声明了成员包用到的全部依赖 |
+
+各模块的职责与最小示例见模块（workspace 包）README：
 [liorium-core](../packages/liorium-core/README.md) ·
 [liorium-vfs](../packages/liorium-vfs/README.md) ·
 [liorium-realm-base](../packages/liorium-realm-base/README.md) ·

@@ -68,11 +68,13 @@ COMMANDS = [
 ]
 
 # 可选 realm 能力包：realm id -> (模块, 类名, 安装提示)。缺包时降级，不炸整个 CLI。
+# 12 个模块都装在同一个发行版 ``liorium`` 里，所以四个提示现在指向同一个包；
+# 保留逐项映射是因为「导入失败」仍然可能发生（只做了部分安装 / 环境被改坏）。
 CAPABILITIES: dict[str, tuple[str, str, str]] = {
-    "core": ("liorium.core_tool_realm", "CoreToolRealm", "liorium-agent[core]"),
-    "memory": ("liorium.memory", "MemoryRealm", "liorium-agent[memory]"),
-    "skills": ("liorium.skills", "SkillsRealm", "liorium-agent[skills]"),
-    "todo": ("liorium.todo_realm", "TodoRealm", "liorium-agent[todo]"),
+    "core": ("liorium.core_tool_realm", "CoreToolRealm", "liorium"),
+    "memory": ("liorium.memory", "MemoryRealm", "liorium"),
+    "skills": ("liorium.skills", "SkillsRealm", "liorium"),
+    "todo": ("liorium.todo_realm", "TodoRealm", "liorium"),
 }
 
 MEMORY_DB_NAME = "memory.sqlite"
@@ -109,8 +111,8 @@ def load_capability_realms(
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """按需导入能力包，返回 ``(realm 工厂表, 缺失原因)``。
 
-    realm 能力包是可选依赖（``liorium-agent[memory]`` / ``[skills]``）：没装、装坏了都只
-    让对应功能降级并给出原因，CLI 的六个核心工具照常可用。
+    12 个模块都在同一个发行版 ``liorium`` 里，正常情况下不会缺；真缺了（只做了部分安装、
+    环境被改坏）也只让对应功能降级并给出原因，CLI 的六个核心工具照常可用。
     """
     names = list(CAPABILITIES) if wanted is None else [n for n in wanted if n in CAPABILITIES]
     factories: dict[str, Any] = {}
@@ -320,7 +322,7 @@ class CliSession:
             from liorium.memory.embeddings import OpenAICompatibleEmbeddings
             from liorium.memory.vectors import NanoVectorBackend
         except ImportError as exc:  # 没装 [vector] extra
-            ui.warn(f"语义检索不可用（{exc}）；装它: pip install 'liorium-memory[vector]'")
+            ui.warn(f"语义检索不可用（{exc}）；装它: pip install 'liorium[vector]'")
             return services
         base = self._memory_base() / "index"
         try:
@@ -840,7 +842,7 @@ class CliSession:
         ui = self.ui
         record = self._realm_record("memory")
         if record is None:
-            ui.info("记忆功能未启用（--no-memory，或没装 liorium-memory）")
+            ui.info("记忆功能未启用（--no-memory，或 liorium.memory 不可用）")
             return
         if record.state != "running":
             if record.state == "stopped":
@@ -948,7 +950,7 @@ class CliSession:
         ui = self.ui
         record = self._realm_record("skills")
         if record is None:
-            ui.info("技能功能未启用（--no-skills，或没装 liorium-skills）")
+            ui.info("技能功能未启用（--no-skills，或 liorium.skills 不可用）")
             return
         if record.state != "running":
             if record.state == "stopped":
@@ -974,7 +976,7 @@ class CliSession:
         ui = self.ui
         record = self._realm_record("todo")
         if record is None:
-            ui.info("待办功能未启用（--no-todo，或没装 liorium-todo-realm）")
+            ui.info("待办功能未启用（--no-todo，或 liorium.todo_realm 不可用）")
             return
         if record.state != "running":
             if record.state == "stopped":

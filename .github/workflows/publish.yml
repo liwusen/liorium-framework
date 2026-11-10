@@ -12,11 +12,11 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: "发布到哪个索引"
+        description: "发布到哪个索引（build-only 只构建，不发布，用于配 PyPI 前演练）"
         type: choice
         required: true
         default: pypi
-        options: [pypi, testpypi]
+        options: [pypi, testpypi, build-only]
 
 concurrency:
   group: publish-${{ github.ref }}
@@ -82,6 +82,8 @@ jobs:
   publish:
     name: publish ${{ matrix.package }}
     needs: build
+    # build-only：只验证 12 个包能构建 + 元数据合法，不碰 PyPI
+    if: github.event_name != 'workflow_dispatch' || inputs.target != 'build-only'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

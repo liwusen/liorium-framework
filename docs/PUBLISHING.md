@@ -18,14 +18,36 @@ tag v0.1.0 ──▶ build（12 个包并行构建 + twine check）
 
 | 字段 | 值 |
 |---|---|
-| PyPI Project Name | `liorium-core`、`liorium-vfs`、`liorium-realm-base`、`liorium-core-tool`、`liorium-core-tool-realm`、`liorium-memory`、`liorium-skills`、`liorium-mcp`、`liorium-todo-realm`、`liorium-provider-manager`、`liorium-agent`、`liorium-cli` |
+| PyPI Project Name | 见下方 12 行清单，一行一个项目 |
 | Owner | `liwusen` |
 | Repository name | `liorium-framework` |
 | Workflow name | `publish.yml` |
 | Environment name | `pypi` |
 
+12 个项目名（勾掉一个就少点一次表单；缺哪个，那次发布就只有那个 job 报 `invalid-publisher`，
+其它包照发）：
+
+- [ ] `liorium-core`
+- [ ] `liorium-vfs`
+- [ ] `liorium-realm-base`
+- [ ] `liorium-core-tool`
+- [ ] `liorium-core-tool-realm`
+- [ ] `liorium-memory`
+- [ ] `liorium-skills`
+- [ ] `liorium-mcp`
+- [ ] `liorium-todo-realm`
+- [ ] `liorium-provider-manager`
+- [ ] `liorium-agent`
+- [ ] `liorium-cli`
+
+依赖闭包参考：`pip install "liorium-agent[core]"` 需要前 6 个；`pip install liorium-cli`
+需要前 11 个；`liorium-agent[mcp]` 才用到 `liorium-mcp`。**全部配齐**才能覆盖 CLI + mcp。
+
 想先演练一遍就用 TestPyPI（<https://test.pypi.org/manage/account/publishing/>）配同样的字段、
 environment 填 `testpypi`，然后手动触发 workflow 选 `testpypi`。
+
+想在配 PyPI **之前**先确认 12 个包都能构建：手动触发 workflow 选 `build-only`
+（只跑 build 矩阵：`uv build --package` + `twine check --strict`，不发任何东西）。
 
 > 名字写错任何一个字符都会得到 `invalid-publisher` 错误，且**不会**退化成密码登录。
 > `Environment name` 留空也可以，但要同步删掉 workflow 里的 `environment:`，两者必须一致。
@@ -43,7 +65,8 @@ git push origin main --tags
 推送 `v*` tag 即触发发布。只想重跑某一个包时，用 Actions 页面 **Re-run failed jobs**；
 同版本已存在于 PyPI 时 `skip-existing: true` 会跳过而不是报错。
 
-手动触发（Actions → Publish to PyPI → Run workflow）可指定 `pypi` / `testpypi`。
+手动触发（Actions → Publish to PyPI → Run workflow）可指定 `pypi` / `testpypi` / `build-only`。
+推荐顺序：先 `build-only` 跑绿 → 配好 12 条 publisher → 推 `v*` tag 真发。
 
 ## 三、本地预跑同样的步骤
 

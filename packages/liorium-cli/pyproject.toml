@@ -1,6 +1,6 @@
 [project]
 name = "liorium-cli"
-version = "0.1.0"
+version = "0.1.1"
 description = "Liorium CLI Agent：真实模型 + 六个核心工具 + 记忆 / 技能 / 子代理"
 readme = "README.md"
 requires-python = ">=3.11"

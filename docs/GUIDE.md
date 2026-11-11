@@ -50,10 +50,24 @@ liorium-cli --help
 工具全部由 realm 提供，Agent 本身不带工具）：
 
 ```powershell
-.\.venv\Scripts\liorium-cli.exe --help
-.\.venv\Scripts\liorium-cli.exe -p "统计仓库里有多少个 .py 文件"
-# 等价：.\.venv\Scripts\python.exe -m liorium.cli
+# 仓库内开发用模块入口（root 是虚拟 workspace，不装 console script）
+# 1) 先配置 provider（交互式；也可以 setup providers add … 一条命令写进去）
+.\.venv\Scripts\python.exe -m liorium.cli setup
+
+# 2) 再对话
+.\.venv\Scripts\python.exe -m liorium.cli --help
+.\.venv\Scripts\python.exe -m liorium.cli -p "统计仓库里有多少个 .py 文件"
+
+# pip 安装后才有 liorium-cli 命令：
+#   liorium-cli setup
+#   liorium-cli -p "统计仓库里有多少个 .py 文件"
 ```
+
+配置落在 `~/.liorium/`：`providers.json`（provider + 密钥，0600）与 `config.json`
+（非密钥设置：默认模型 / 思考 / 记忆 / 技能 / UI）。两个文件都可以不存在——新机器第一次
+运行会建空骨架并进入「未配置」模式，`/setup` 或 `liorium-cli setup` 随时补配置；
+`liorium-cli setup show|doctor|memory …` 见
+[liorium-cli README](../packages/liorium-cli/README.md)。
 
 ## 2. 最小 Agent（离线可跑）
 

@@ -26,7 +26,7 @@ agent = LioriumAgent(
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # 轻量面：只要关键词检索就不需要 numpy / httpx（它们在 [vector] extra 里，
 # 由 ``liorium.memory.vectors`` / ``liorium.memory.embeddings`` 直接 import）。

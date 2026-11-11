@@ -19,6 +19,21 @@
 | [`docs/MEMORY.md`](docs/MEMORY.md)             | 记忆自系统                                                                  |
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | 架构介绍                                                                   |
 
+### 命令行：安装后先配置
+
+```powershell
+pip install "liorium[all]"
+liorium-cli setup                 # 交互式：provider / 记忆系统（也支持 setup providers add …）
+liorium-cli setup show            # 配置一览（密钥打码）
+liorium-cli setup doctor          # 体检：文件 / key / 目录 / 依赖
+liorium-cli                       # 进入 REPL；/setup 也能配
+```
+
+配置在 `~/.liorium/`：`providers.json`（provider + 密钥，0600）与 `config.json`
+（默认模型 / 思考 / 记忆 / 技能 / UI）。两个文件都可以不存在——新机器第一次运行会建空骨架
+并进入「未配置」模式，不会因为缺配置起不来。详见
+[`packages/liorium-cli/README.md`](packages/liorium-cli/README.md)。
+
 ### 例子: 最小 Agent
 
 ```python

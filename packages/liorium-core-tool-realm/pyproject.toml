@@ -1,6 +1,6 @@
 [project]
 name = "liorium-core-tool-realm"
-version = "0.1.0"
+version = "0.1.1"
 description = "Liorium 核心工具能力包：把 read / write / edit / search / find / execute 装成 core realm"
 readme = "README.md"
 requires-python = ">=3.11"

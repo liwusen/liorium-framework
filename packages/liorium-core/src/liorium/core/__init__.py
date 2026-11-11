@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .canonical import canonicalize, fingerprint, short_fingerprint
 from .errors import (

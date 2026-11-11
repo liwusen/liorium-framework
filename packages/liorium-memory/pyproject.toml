@@ -1,6 +1,6 @@
 [project]
 name = "liorium-memory"
-version = "0.1.0"
+version = "0.1.1"
 description = "Liorium 记忆能力包：SQLite 存储（v1 schema）+ 混合检索 + 实体图谱 + MemoryRealm"
 readme = "README.md"
 requires-python = ">=3.11"

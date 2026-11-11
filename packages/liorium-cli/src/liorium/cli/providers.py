@@ -4,18 +4,21 @@
 ``liorium-provider-manager``（``liorium.provider``）。本模块只保留**宿主策略**：
 
 - 默认配置搜索顺序（``$LIORIUM_PROVIDER_CONFIG`` → ``~/.liorium/providers.json`` → ``./providers.json``）；
-- 没有配置文件时用 ``LIORIUM_*`` 环境变量拼一个 provider；
-- 交互式向导；
-- 保存到 ``~/.liorium/providers.json``。
+- 空配置（文件不存在 / ``providers`` 为空）判定为"还没配置"，由 :mod:`liorium.cli.app`
+  决定进入「未配置」模式而不是在这里提问；
+- 没有配置文件且没有环境变量时用 ``LIORIUM_*`` 环境变量拼一个 provider；
+- 交互式向导（``setup`` 与遗留的 ``registry_from_args_or_prompt`` 共用）。
 
-命令行与环境变量永远优先；配置文件只读加载，不会写回。
+命令行与环境变量永远优先；配置文件只读加载，写回只在 :mod:`liorium.cli.setup` 里发生。
 """
 
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any
 
 from liorium.provider import (
     DEFAULT_FORMAT,
@@ -79,14 +82,30 @@ def make_chat_model(
 
 
 def default_config_candidates() -> list[Path]:
-    """默认搜索顺序：环境变量 → 用户主目录的配置 → 当前目录的 ``providers.json``。"""
+    """默认搜索顺序：环境变量 → 配置根目录的 ``providers.json`` → 当前目录的 ``providers.json``。"""
+    from .config import home_dir
+
     candidates: list[Path] = []
     env_path = os.environ.get("LIORIUM_PROVIDER_CONFIG")
     if env_path:
         candidates.append(Path(env_path).expanduser())
-    candidates.append(Path.home() / ".liorium" / "providers.json")
+    candidates.append(home_dir() / "providers.json")
     candidates.append(Path.cwd() / "providers.json")
     return candidates
+
+
+def _is_empty_config(path: Path) -> bool:
+    """文件里一个 provider 都没有（= 还没配置）。
+
+    畸形 JSON / 非对象顶层**不算空**：交给 :meth:`ProviderRegistry.load` 报明确的错。
+    """
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(raw, dict):
+        return False
+    return not raw.get("providers")
 
 
 def load_registry(
@@ -96,21 +115,47 @@ def load_registry(
 ) -> tuple[ProviderRegistry | None, list[Path]]:
     """按顺序找配置；找到就返回 ``(registry, 尝试过的路径)``。
 
-    显式给了 ``explicit`` 但文件不存在时**直接报错**（用户意图明确，不能静默换源）。
+    - 显式给了 ``explicit`` 但文件不存在时**直接报错**（用户意图明确，不能静默换源）；
+    - 文件存在但没有任何 provider 时返回 ``(None, tried)``——这是"新机器还没配置"，
+      不是错误，宿主会进「未配置」模式。
     """
     tried: list[Path] = []
     if explicit is not None:
         target = Path(explicit).expanduser()
         tried.append(target)
+        if _is_empty_config(target):
+            return None, tried
         return ProviderRegistry.load(target), tried
     for candidate in candidates if candidates is not None else default_config_candidates():
         tried.append(candidate)
         if candidate.is_file():
+            if _is_empty_config(candidate):
+                return None, tried
             return ProviderRegistry.load(candidate), tried
     from_env = ProviderRegistry.from_env()
     if from_env is not None:
         return from_env, tried
     return None, tried
+
+
+def ensure_registry(
+    *,
+    config: Path | None = None,
+    create: bool = True,
+) -> tuple[ProviderRegistry | None, list[Path], dict[str, Any]]:
+    """启动期入口：加载配置，没有就建空骨架。
+
+    返回 ``(registry 或 None, 尝试过的路径, 本次新建的文件)``。**不读 stdin**：
+    交互式配置属于 ``liorium-cli setup`` 与 REPL 的 ``/setup``。
+    """
+    registry, tried = load_registry(config)
+    created: dict[str, Any] = {}
+    if registry is None and config is None and create:
+        from .config import ensure_home
+
+        created = ensure_home()
+    return registry, tried, created
+
 
 
 def save_registry(registry: ProviderRegistry, path: Path) -> Path:
@@ -190,7 +235,11 @@ def registry_from_args_or_prompt(
     print_fn: Callable[[str], None] = print,
     ask_save: Callable[[str], str] = input,
 ) -> ProviderRegistry:
-    """CLI 的统一入口：``--config`` → 默认候选 → 询问用户（并可选保存）。"""
+    """遗留入口（示例脚本还在用）：加载配置；没有就逐项询问并可选保存。
+
+    新的宿主代码用 :func:`ensure_registry` + ``setup`` 向导；这里保留旧行为是为了
+    不破坏 ``examples/multi_agent.py`` 这类"一条命令跑起来"的脚本。
+    """
     registry, tried = load_registry(config)
     if registry is not None:
         return registry
@@ -206,6 +255,7 @@ def registry_from_args_or_prompt(
     return registry
 
 
+
 __all__ = [
     "DEFAULT_FORMAT",
     "Provider",
@@ -215,6 +265,7 @@ __all__ = [
     "SUPPORTED_FORMATS",
     "THINKING_DIALECTS",
     "default_config_candidates",
+    "ensure_registry",
     "infer_format_from_url",
     "load_registry",
     "make_chat_model",

@@ -25,7 +25,7 @@ agent = LioriumAgent(
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .catalog import Skill, catalog_signature, discover_skills
 from .frontmatter import read_skill_meta, split_frontmatter

@@ -7,11 +7,12 @@ import importlib
 import json
 import os
 import traceback
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any
 
-from liorium.agent import AgentSpec, Limits, RealmSpec, LioriumAgent
+from liorium.agent import AgentSpec, Limits, LioriumAgent, RealmSpec
 from liorium.core.errors import RealmNotFoundError, TurnError, TurnInterrupted
 from liorium.core.log import get_logger
 from liorium.core.types import ContextItem, Event
@@ -47,6 +48,7 @@ DEFAULT_SYSTEM_PROMPT = """\
 
 COMMANDS = [
     ("/help", "显示帮助"),
+    ("/setup [providers|memory]", "交互式配置 provider / 记忆系统（写入 ~/.liorium）"),
     ("/model [Provider::model]", "列出或切换模型"),
     ("/provider <name>", "切换 provider（保留同名模型）"),
     ("/thinking [off|low|medium|high]", "查看或切换思考强度"),
@@ -176,6 +178,10 @@ class CliOptions:
     """关掉后不自动抽实体（``--no-extraction``）。"""
     models_dev_cache: Path | None = None
     """models.dev 缓存文件（启动期由 app 解析并传入；``/models-dev`` 用同一路径）。"""
+    config_file: Path | None = None
+    """``config.json`` 路径（``/setup`` 写这里；None = 启动时的默认位置）。"""
+    providers_file: Path | None = None
+    """``providers.json`` 路径（``/setup`` 写这里；None = 启动时的默认位置）。"""
     env_report: EnvReport | None = None
     """本次加载的 ``.env``（``/status`` 显示来源；``None`` = 没加载或 ``--no-env``）。"""
 
@@ -636,6 +642,8 @@ class CliSession:
             await self._command_model(argument)
         elif command == "/provider":
             await self._command_provider(argument)
+        elif command == "/setup":
+            await self._command_setup(argument)
         elif command == "/thinking":
             await self._command_thinking(argument)
         elif command == "/models-dev":
@@ -1343,6 +1351,130 @@ class CliSession:
             return
         model = self.resolved.model if self.resolved.model in provider.models else provider.models[0]
         await self._switch_to(self.registry.resolve(f"{provider.name}::{model}"))
+
+    # -- 配置（与 liorium-cli setup 共用同一套实现） ---------------------
+
+    async def _command_setup(self, argument: str) -> None:
+        """``/setup [providers|memory|show|doctor|init]``。
+
+        写入 ``~/.liorium/providers.json`` / ``config.json``（与 ``liorium-cli setup``
+        完全一致），并在当前会话里尽量热应用：provider 切换模型、记忆开关重建 realm。
+        """
+        from . import setup as cli_setup
+        from .config import ConfigError, config_path, providers_path
+
+        ctx = cli_setup.Ctx(
+            providers=Path(self.options.providers_file or providers_path()),
+            config_file=Path(self.options.config_file or config_path()),
+            input_fn=self.input_fn,
+            print_fn=self.ui.writeln,
+            inbox=self.options.inbox,
+        )
+        topic = argument.strip().split()[0].lower() if argument.strip() else ""
+        if topic in ("show", "status"):
+            cli_setup.print_overview(ctx)
+            return
+        if topic in ("doctor", "check"):
+            cli_setup.doctor(ctx)
+            return
+        if topic == "init":
+            cli_setup.setup_init(ctx)
+            return
+        try:
+            result = cli_setup.wizard(ctx, topic or None)
+        except (ConfigError, ProviderConfigError) as exc:
+            self.ui.error(str(exc))
+            return
+        await self._apply_setup_result(result)
+
+    async def _apply_setup_result(self, result: Any) -> None:
+        """把配置向导的改动落到当前会话（能不重启就不重启）。"""
+        if result.providers_changed:
+            await self._reload_registry(result.provider_label)
+        if result.memory_changed:
+            await self._apply_memory_result(result)
+
+    async def _reload_registry(self, label: str | None) -> None:
+        """重新读 providers.json，并切到指定（或默认）模型。"""
+        from .config import providers_path
+
+        path = Path(self.options.providers_file or providers_path())
+        try:
+            registry = ProviderRegistry.load(path)
+        except ProviderConfigError as exc:
+            self.ui.warn(f"provider 配置已写入，但读不出来: {exc}")
+            return
+        # 同一个标签的 base_url / key 可能刚被改过：旧模型客户端必须丢弃。
+        for model in self._model_cache.values():
+            try:
+                await close_chat_model(model)
+            except Exception as exc:  # noqa: BLE001 - 关闭失败不阻断配置生效
+                log.warning("关闭旧模型客户端失败: %s", exc)
+        self._model_cache.clear()
+        self.registry = registry
+        target = (label or "").strip()
+        if not target:
+            try:
+                target = registry.default_label()
+            except ProviderConfigError as exc:
+                self.ui.warn(f"provider 已更新，但没有可用模型: {exc}")
+                return
+        try:
+            resolved = registry.resolve(target)
+        except ProviderConfigError as exc:
+            self.ui.warn(f"provider 已更新；{target} 暂时不可用: {exc}")
+            return
+        if self.agent is None:
+            self.resolved = resolved
+            self.ui.info(f"已切换到 {resolved.label}")
+            return
+        await self._switch_to(resolved)
+
+    async def _apply_memory_result(self, result: Any) -> None:
+        """把 memory.* 设置读回 options，并尽量热重建记忆 realm。"""
+        from . import config as cli_config
+        from .config import ConfigError
+
+        try:
+            config = cli_config.load_config(self.options.config_file)
+        except ConfigError as exc:
+            self.ui.error(f"读取记忆设置失败: {exc}")
+            return
+        options = self.options
+        options.embed_model = str(
+            cli_config.get_value(config, "memory.embed_model", "") or ""
+        )
+        options.embed_base_url = str(
+            cli_config.get_value(config, "memory.embed_base_url", "") or ""
+        )
+        options.embed_key = str(cli_config.get_value(config, "memory.embed_key", "") or "")
+        options.enable_vectors = bool(cli_config.get_value(config, "memory.vectors", True))
+        options.enable_extraction = bool(
+            cli_config.get_value(config, "memory.extraction", True)
+        )
+        if result.memory_dir_changed:
+            raw = cli_config.get_value(config, "memory.dir")
+            options.memory_dir = Path(str(raw)).expanduser() if raw else None
+
+        if result.memory_enabled is not None:
+            options.enable_memory = result.memory_enabled
+            if self.agent is not None and "memory" in self.capabilities:
+                await self._toggle_realm("memory", result.memory_enabled)
+            else:
+                self.ui.info("记忆开关已保存：重启 CLI 后生效（启动时被 --no-memory 关掉了）")
+            return
+
+        if result.memory_dir_changed:
+            self.ui.info("记忆目录已保存：重启 CLI 后生效（realm 路径在启动时装配）")
+            return
+        if result.memory_embed_changed and self.agent is not None:
+            if self._realm_instance("memory") is not None:
+                await self._toggle_realm("memory", False)
+                await self._toggle_realm("memory", True)
+                self.ui.info("记忆 realm 已按新的 embedding 设置重建")
+            else:
+                self.ui.info("embedding 设置已保存：/realm enable memory 或重启后生效")
+
 
     async def _switch_to(self, resolved: ResolvedModel) -> None:
         assert self.agent is not None

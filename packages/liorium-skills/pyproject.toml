@@ -1,6 +1,6 @@
 [project]
 name = "liorium-skills"
-version = "0.1.0"
+version = "0.1.1"
 description = "Liorium 技能能力包：SKILL.md 目录 + SkillsRealm"
 readme = "README.md"
 requires-python = ">=3.11"

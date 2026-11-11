@@ -70,7 +70,7 @@
 | `short_fingerprint` | `short_fingerprint(value: Any, length: int = 12) -> str` | 仅用于日志 |
 | `configure` | `configure(level: int \| str \| None = None) -> None` | 给 `liorium` logger 挂 stderr handler，幂等；级别优先级：显式参数 > `LIORIUM_LOG_LEVEL` > `INFO` |
 | `get_logger` | `get_logger(name: str \| None = None) -> logging.Logger` | 取 `liorium.<name>` |
-| `__version__` | `"0.1.0"` | 包版本 |
+| `__version__` | `"0.1.1"` | 包版本 |
 
 异常（全部继承 `LioriumError`）：
 
@@ -992,11 +992,11 @@ McpRealm(spec: Any = None, *, client_factory: Callable[[McpServerConfig], McpCli
 
 | 名字 | 签名 | 语义 |
 |---|---|---|
-| `main` | `main(argv: Sequence[str] \| None = None) -> int` | 控制台入口；返回进程退出码（130 = Ctrl+C） |
-| `run_cli` | `async run_cli(argv=None, *, registry=None, model_factory=None, input_fn=input, install_signal=True) -> int` | 可嵌入的异步入口（测试/别的宿主复用） |
-| `build_parser` | `build_parser() -> argparse.ArgumentParser` | 参数表；`--env-file` / `--no-env` 先于 parser 求值 |
-| `CliOptions` | `workspace`、`inbox`、`system_prompt`、`temperature`、`max_turns`、`thinking`、`show_reasoning`、`json_mode`、`color`、`show_banner`、`enable_core_tools`、`tools`、`enable_memory`、`enable_skills`、`enable_subagents`、`memory_dir`、`skills_dir`、`embed_*`、`enable_vectors`、`enable_extraction`、`models_dev_cache`、`env_report` | 一次会话的配置 |
-| `CliSession` | `CliSession(registry, resolved, options, *, input_fn=input, ui=None, model_factory=None)` | `async start/close`、`async run_turn(text) -> bool`、`async repl() -> int`、`async handle_command(line) -> bool` |
+| `main` | `main(argv: Sequence[str] \| None = None) -> int` | 控制台入口；`main(["setup", …])` 直接转给 `liorium.cli.setup`；返回进程退出码（130 = Ctrl+C） |
+| `run_cli` | `async run_cli(argv=None, *, registry=None, model_factory=None, input_fn=input, install_signal=True, interactive=None) -> int` | 可嵌入的异步入口（测试/别的宿主复用）；`interactive=None` 时看 `sys.stdin.isatty()`，否则用它决定 REPL / 单轮 |
+| `build_parser` | `build_parser(*, config: Mapping[str, Any] \| None = None) -> argparse.ArgumentParser` | 参数表；`config` 是 `config.json` 内容（`None` = 不读配置文件）。优先级：命令行 > 环境变量 > `config.json` > 内置默认 |
+| `CliOptions` | `workspace`、`inbox`、`system_prompt`、`temperature`、`max_turns`、`thinking`、`show_reasoning`、`json_mode`、`color`、`show_banner`、`enable_core_tools`、`tools`、`enable_memory`、`enable_skills`、`enable_subagents`、`memory_dir`、`skills_dir`、`embed_*`、`enable_vectors`、`enable_extraction`、`models_dev_cache`、`config_file`、`providers_file`、`env_report` | 一次会话的配置 |
+| `CliSession` | `CliSession(registry, resolved, options, *, input_fn=input, ui=None, model_factory=None)` | `async start/close`、`async run_turn(text) -> bool`、`async repl() -> int`、`async handle_command(line) -> bool`；`/setup` 会热切模型 / 重建记忆 realm |
 
 ### 8.2 子代理观测
 
@@ -1017,14 +1017,21 @@ McpRealm(spec: Any = None, *, client_factory: Callable[[McpServerConfig], McpCli
 
 | 模块 | 公开名字 |
 |---|---|
-| `liorium.cli.providers` | `Provider`（= `ModelProvider`）、`ProviderRegistry`、`ResolvedModel`、`ProviderConfigError`、`make_chat_model`、`load_registry`、`registry_from_args_or_prompt`、`prompt_for_registry`、`save_registry`、`normalize_format`、`infer_format_from_url`、`default_config_candidates`、`DEFAULT_FORMAT`、`SUPPORTED_FORMATS`、`THINKING_DIALECTS` |
+| `liorium.cli.providers` | `Provider`（= `ModelProvider`）、`ProviderRegistry`、`ResolvedModel`、`ProviderConfigError`、`make_chat_model`、`load_registry`、`ensure_registry`、`registry_from_args_or_prompt`（遗留）、`prompt_for_registry`、`save_registry`、`normalize_format`、`infer_format_from_url`、`default_config_candidates`、`DEFAULT_FORMAT`、`SUPPORTED_FORMATS`、`THINKING_DIALECTS` |
+| `liorium.cli.config` | `load_config` / `save_config` / `ensure_home` / `default_config`、`config_path` / `providers_path` / `home_dir` / `cache_dir`、`KEYS` / `DEFAULT_CONFIG` / `SECRET_KEYS`、`get_value` / `set_value` / `unset_value` / `coerce`、`mask_secret` / `describe_value`、`ConfigError`、`LIORIUM_HOME` / `LIORIUM_CONFIG_FILE` |
+| `liorium.cli.setup` | `main`（`liorium-cli setup`）、`build_parser`、`Ctx` / `make_ctx`、`providers_add/edit/remove/default/test/set_key/list/show`、`memory_show/set/enable/init/path`、`wizard` / `wizard_providers` / `wizard_memory`、`overview` / `print_overview`、`doctor` / `run_checks`、`ensure_layout` |
 | `liorium.cli.env` | `EnvReport`、`EnvFileError`、`load_env`、`parse_env_file`、`write_env_file`、`default_env_candidates`、`env_bool/env_int/env_float/env_str/env_path`、`as_dict`、`ENV_PREFIX` |
 | `liorium.cli.ui` | `Ui`、`configure_streams`、`truncate`、`indent`、`short_json`、`clock`、`duration`、`char_count`、`local_time`、`memory_meta` |
 
 `liorium.cli.providers` 是**宿主适配层**：配置搜索、环境变量、向导、保存路径。
 真正的 schema / 格式 / 思考 / models.dev / 模型构建在 `liorium.provider`（见 §9）。
-配置优先级：**命令行 > 进程环境变量 > `./.env` / `./.env.local` > 默认**；
+配置优先级：**命令行 > 进程环境变量 > `./.env` / `./.env.local` > `~/.liorium/config.json` > 默认**；
 `LIORIUM_*` 前缀与 `--no-*` 开关一一对应（含 `LIORIUM_NO_SUBAGENTS`）。
+
+`~/.liorium/providers.json` 存 provider 与密钥（0600），`~/.liorium/config.json` 只存非密钥设置；
+两者都可缺省，`LIORIUM_HOME` 可整体改根目录。**两者都不存在时不提问**：`run_cli` 建空骨架后进
+「未配置」REPL（只支持 `/setup`、`/show`、`/doctor`、`/init`、`/path`、`/exit`），
+非交互环境（`-p` / `--json` / 管道）则以退出码 2 提示先跑 `liorium-cli setup`。
 
 思考开关：`--thinking off|low|medium|high`（默认 `medium`）、`--no-thinking`
 （= off）、`--hide-reasoning`（只隐藏显示）。`LIORIUM_TEMPERATURE` 只在思考关闭时生效。

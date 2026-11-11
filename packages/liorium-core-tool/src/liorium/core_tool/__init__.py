@@ -7,7 +7,7 @@ registry 零全局过滤。工具只与 VFS 和 ``liorium.core`` 声明的端口
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .read import build_read_tool
 from .runtime import ResolvedPath, ToolRuntime

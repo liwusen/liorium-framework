@@ -1,6 +1,6 @@
 [project]
 name = "liorium-provider-manager"
-version = "0.1.0"
+version = "0.1.1"
 description = "Liorium LLM Provider 管理：配置 schema、四种 API 格式、思考能力、models.dev 目录"
 readme = "README.md"
 requires-python = ">=3.11"

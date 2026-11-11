@@ -1,6 +1,6 @@
 [project]
 name = "liorium-vfs"
-version = "0.1.0"
+version = "0.1.1"
 description = "Liorium 虚拟文件系统：VfsNode / VirtualFileSystem / mount（零第三方依赖）"
 readme = "README.md"
 requires-python = ">=3.11"

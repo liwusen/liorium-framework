@@ -1,6 +1,6 @@
 [project]
 name = "liorium-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Liorium MCP 能力包：MCP 客户端（stdio/sse/http）+ McpRealm"
 readme = "README.md"
 requires-python = ">=3.11"

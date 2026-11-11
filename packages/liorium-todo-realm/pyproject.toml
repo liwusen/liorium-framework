@@ -1,6 +1,6 @@
 [project]
 name = "liorium-todo-realm"
-version = "0.1.0"
+version = "0.1.1"
 description = "Liorium 待办能力包：状态化 Todo + 每 N 回合的周期提醒"
 readme = "README.md"
 requires-python = ">=3.11"

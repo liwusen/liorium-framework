@@ -11,28 +11,95 @@ Liorium 的官方命令行 Agent：真实模型 + realm 能力包（核心工具
 在工作区里（开发）：
 
 ```powershell
-uv sync --all-packages
-uv run liorium-cli
-# 等价入口
-uv run python -m liorium.cli
+uv sync --all-packages --all-extras
+uv run python -m liorium.cli        # 仓库内：root 是虚拟 workspace，不装 console script
 ```
 
 从 PyPI 安装后直接：
 
 ```powershell
+liorium-cli setup          # 先配置 provider（可交互，也可 setup providers add …）
 liorium-cli
 liorium-cli -p "看看当前目录有什么文件"
 echo "总结 README" | liorium-cli --json
 ```
 
-默认读取 `~/.liorium/providers.json`（provider / key / base_url /
-每模型格式 / 上下文长度 / 思考方言）；找不到时逐项询问，并可保存到 `~/.liorium/providers.json`。
-所有选项都能写进 `./.env`（见仓库根的 `.env.example`），优先级：
-**命令行 > 进程环境变量 > `.env` > 默认**。
+基础安装（`pip install liorium`）自带 OpenAI 兼容 SDK（CLI 的默认格式），所以 DeepSeek /
+OpenRouter / 本地 vLLM 这类端点装完就能用；Anthropic / Google 协议需要
+`liorium[anthropic]` / `liorium[google]`（或一次装 `liorium[all]`）。
 
-Provider 管理本身在 `liorium-provider-manager`（`liorium.provider`）：四种 API 格式、
-思考参数、`/models` 自动发现、models.dev 目录识别与模型构建都由它负责；本包只保留
-配置搜索、向导与终端交互。
+## 配置（provider / 记忆系统）
+
+两个文件，都**可以不存在**；缺省时用内置默认，启动不会因配置缺失失败：
+
+| 文件 | 内容 |
+|---|---|
+| `~/.liorium/providers.json` | provider / key / base_url / 每模型格式 / 上下文长度 / 思考方言（0600） |
+| `~/.liorium/config.json` | 非密钥设置：默认模型、思考强度、工作区、记忆（目录 / embedding / 开关）、技能、UI |
+
+优先级：**命令行 > 进程环境变量 > `./.env` > `config.json` > 内置默认**；`LIORIUM_HOME`
+可以整体换掉配置根目录（多套配置 / 测试）。
+
+### 命令行配置
+
+```powershell
+liorium-cli setup                        # 交互式菜单（provider / 记忆 / 查看 / 体检）
+liorium-cli setup show                   # 全部配置一览（密钥打码）
+liorium-cli setup doctor                 # 体检：文件 / key / 目录 / 依赖
+liorium-cli setup init                   # 只建空骨架，不写任何凭据
+liorium-cli setup path                   # 打印各配置文件位置
+
+liorium-cli setup providers list
+liorium-cli setup providers add deepseek `
+    --base-url https://api.deepseek.com --model deepseek-chat --model deepseek-reasoner `
+    --api-format openai_chat --context 128000 --thinking deepseek
+liorium-cli setup providers set-key deepseek      # 不回显；也可 --key sk-…
+liorium-cli setup providers edit deepseek --model deepseek-v4.1-flash --rm-model deepseek-chat
+liorium-cli setup providers default deepseek::deepseek-chat
+liorium-cli setup providers test deepseek::deepseek-chat          # 本地校验；--network 请求 /models
+liorium-cli setup providers rm deepseek
+
+liorium-cli setup memory show
+liorium-cli setup memory set dir D:/data/liorium-memory
+liorium-cli setup memory set embed-model text-embedding-3-small
+liorium-cli setup memory set vectors off
+liorium-cli setup memory enable / disable
+liorium-cli setup memory init                     # 建目录 + 空记忆库
+
+liorium-cli setup set thinking low                # 其余设置：get / set / unset
+liorium-cli setup --json show                     # 脚本化：JSON 输出
+```
+
+语义约定：
+
+- 写入**原子**（临时文件 + `os.replace`，0600），写失败会报错，不会假装成功；
+- `add` 的失败不会留下半个 provider；重名 / 非法 URL / 未知格式 / 非法上下文一律拒绝并给出可用值；
+- 第一个 provider 自动成为默认模型；`rm` 掉默认 provider 时自动回退到下一个可用模型；
+- 密钥只进 `providers.json`，`config.json` 里只有 `memory.embed_key`（显示时打码）。
+
+### CLI 内交互式配置
+
+直接 `liorium-cli`，在提示符里：
+
+```
+liorium[...]> /setup              # 顶层菜单：provider / 记忆 / 查看 / 体检 / 建空配置
+liorium[...]> /setup providers    # 直接进 provider 子菜单
+liorium[...]> /setup memory       # 直接进记忆子菜单
+liorium[...]> /setup show         # 当前配置一览
+```
+
+改完立刻生效：provider 变更会重新读 `providers.json` 并热切换到默认模型；记忆开关走
+`/realm enable|disable memory`；embedding 设置变化会重建记忆 realm。只有**记忆库目录**
+变更需要重启（realm 路径在启动时装配），提示会写明。
+
+### 新电脑第一次运行
+
+什么配置都没有时，`liorium-cli` 会：
+
+1. 建出 `~/.liorium/`、空的 `providers.json`（`{"providers": []}`）与 `config.json`；
+2. 进入「未配置」REPL：`/help` `/setup` `/show` `/doctor` `/init` `/path` `/exit` 可用，
+   普通提问只提示先配置；
+3. 非交互场景（`-p`、`--json`、管道）直接以退出码 2 提示 `liorium-cli setup …`，不会卡住等 stdin。
 
 ## 常用参数
 
@@ -60,9 +127,10 @@ Provider 管理本身在 `liorium-provider-manager`（`liorium.provider`）：�
 
 ## 斜杠命令
 
-`/help` `/model` `/provider` `/thinking` `/models-dev` `/clear` `/status` `/tools`
+`/help` `/setup` `/model` `/provider` `/thinking` `/models-dev` `/clear` `/status` `/tools`
 `/memory` `/skills` `/todo` `/realm` `/reload` `/inject` `/context` `/history` `/subagent` `/exit`。
 
+- `/setup`：见上「CLI 内交互式配置」。
 - `/todo`：列出待办（默认只看未完成，`/todo all` 含已完成）；未完成的待办会由
   `liorium-todo-realm` 每 50 个回合往上下文里提醒一次（`context_first` 让第 1 回合先提醒）。
 - `/realm`：列出每个 realm 的状态 / 工具数 / 挂载 / 上下文节奏（`每 50 回合 · 下次 12`），
@@ -100,8 +168,10 @@ Provider 管理本身在 `liorium-provider-manager`（`liorium.provider`）：�
 
 ```
 src/liorium/cli/
-├── app.py        # 参数解析 / .env 装载 / run_cli
+├── app.py        # 参数解析 / .env 装载 / 冷启动 / run_cli
 ├── session.py    # CliSession：Agent 装配、REPL、斜杠命令
+├── setup.py      # setup 子命令 + 交互式向导（provider / 记忆）
+├── config.py     # ~/.liorium/config.json：schema / 读写 / 冷启动骨架
 ├── subagents.py  # 子代理事件监控与渲染
 ├── providers.py  # 配置搜索 / 向导 / 模型工厂（委托 liorium.provider）
 ├── env.py        # .env 解析与优先级

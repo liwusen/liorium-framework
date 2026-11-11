@@ -22,7 +22,7 @@ class LioriumAgent:
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .agent import LioriumAgent
 from .context import ContextChannel

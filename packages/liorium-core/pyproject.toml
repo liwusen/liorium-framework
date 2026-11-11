@@ -1,6 +1,6 @@
 [project]
 name = "liorium-core"
-version = "0.1.0"
+version = "0.1.1"
 description = "Liorium 核心契约：类型 / URI / 指纹 / 日志（零第三方依赖）"
 readme = "README.md"
 requires-python = ">=3.11"

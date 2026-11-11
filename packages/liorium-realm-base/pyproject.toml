@@ -1,6 +1,6 @@
 [project]
 name = "liorium-realm-base"
-version = "0.1.0"
+version = "0.1.1"
 description = "Liorium realm 契约与写作 API：Realm / BaseRealm / RealmContext / 状态 store / @realm_tool"
 readme = "README.md"
 requires-python = ">=3.11"

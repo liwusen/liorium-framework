@@ -189,18 +189,26 @@ def memory_realm(spec):
 
 要语义检索/实体抽取，两种装法：
 
-### A0. `.env` 文件（推荐）
+### A0. `~/.liorium/config.json` / `.env` 文件
 
-所有 CLI 配置都能写进 `.env`，不用每次带一长串参数：
+记忆相关的开关可以持久化，避免每次带一长串参数：
+
+```powershell
+liorium-cli setup memory set dir D:/data/liorium-memory
+liorium-cli setup memory set embed-model text-embedding-3-small
+liorium-cli setup memory show
+```
+
+也可以用 `.env`（临时覆盖；优先级：命令行 > 环境变量 > `.env` > `config.json` > 内置默认）：
 
 ```powershell
 Copy-Item .env.example .env    # 模板（已入库，无密钥）
 notepad .env                   # 填 provider / 模型 / 记忆目录 / embedding
-uv run liorium-cli
+uv run python -m liorium.cli
 ```
 
 - **查找顺序**：`$env:LIORIUM_ENV_FILE` → `./.env` → `./.env.local`；
-- **优先级**：命令行 > 进程环境变量 > `.env` > 内置默认（`.env` 永远不覆盖已存在的环境变量）；
+- **优先级**：命令行 > 进程环境变量 > `.env` > `~/.liorium/config.json` > 内置默认（`.env` 永远不覆盖已存在的环境变量）；
 - `--env-file <path>` 指定文件，`--no-env` 完全不读；`$env:LIORIUM_ENV_FILE=""` 也能关掉自动加载；
 - 键名 = `LIORIUM_` + 选项名大写（`--no-color` → `LIORIUM_NO_COLOR=1`，`--memory-dir` → `LIORIUM_MEMORY_DIR=...`）；
 - 支持 `# 注释`、`export KEY=...`、单/双引号、`${VAR}` 引用前面定义的键；
@@ -220,20 +228,29 @@ uv run liorium-cli
 
 ```powershell
 # 只开语义检索（复用 chat provider 的 key 与 base_url）
-uv run liorium-cli --embed-model text-embedding-3-small
+uv run python -m liorium.cli --embed-model text-embedding-3-small
 
 # 换个 embedding 端点（比如本地/代理）
-uv run liorium-cli `
+uv run python -m liorium.cli `
     --embed-model bge-m3 --embed-base-url http://127.0.0.1:8080/v1 --embed-key local
 
 # 接管旧库 + 关掉抽取
-uv run liorium-cli `
+uv run python -m liorium.cli `
     --memory-dir "D:\path\to\agent\memory" --no-extraction
 ```
 
-chat 模型本身仍走原有 provider 配置：`LIORIUM_PROVIDER_CONFIG` → `~/.liorium/providers.json`
-→ `~/.liorium/providers.json`（`--config` 可显式指定）。embedding 默认复用**当前 chat provider**
-的 `base_url` 与 `key`，所以大多数 OpenAI 兼容端点不用额外配。
+chat 模型本身仍走原有 provider 配置：`LIORIUM_PROVIDER_CONFIG` → `<LIORIUM_HOME>/providers.json`
+（默认 `~/.liorium/providers.json`）→ `./providers.json`（`--config` 可显式指定）。embedding 默认复用
+**当前 chat provider** 的 `base_url` 与 `key`，所以大多数 OpenAI 兼容端点不用额外配。
+
+上面这些开关也可以持久化，不用每次敲参数（写进 `~/.liorium/config.json`，命令行与环境变量仍然优先）：
+
+```powershell
+liorium-cli setup memory set dir D:/data/liorium-memory
+liorium-cli setup memory set embed-model text-embedding-3-small
+liorium-cli setup memory set vectors off       # 只跑关键词检索
+liorium-cli setup memory show                  # 看当前记忆配置与库位置
+```
 
 ### B. 库内（自己装配 realm）
 

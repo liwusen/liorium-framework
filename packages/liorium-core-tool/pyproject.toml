@@ -1,6 +1,6 @@
 [project]
 name = "liorium-core-tool"
-version = "0.1.0"
+version = "0.1.1"
 description = "Liorium 六个核心工具：read / write / edit / search / find / execute"
 readme = "README.md"
 requires-python = ">=3.11"

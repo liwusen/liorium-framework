@@ -8,7 +8,7 @@ Liorium 只发布**一个**发行版：`liorium`。12 个模块（`core` / `vfs`
 工作流：[`.github/workflows/publish.yml`](../.github/workflows/publish.yml)
 
 ```
-tag v0.1.0 ──▶ build（1 个 sdist + 1 个 wheel，内含 12 个模块
+tag v0.1.1 ──▶ build（1 个 sdist + 1 个 wheel，内含 12 个模块
                     + twine check + check_wheel 验模块齐全）
             └▶ publish（OIDC 换一次性上传凭证，1 条 publisher）
                └▶ release（把 sdist/wheel 挂到 GitHub Release）
@@ -58,8 +58,8 @@ TestPyPI 与 PyPI 是两套独立登记，配与不配都不影响正式发布�
 
 ```bash
 # 两处都改成 0.1.0 之后
-git commit -am "release: v0.1.0"
-git tag v0.1.0
+git commit -am "release: v0.1.1"
+git tag v0.1.1
 git push origin main --tags
 ```
 
@@ -73,7 +73,7 @@ git push origin main --tags
 
 ```powershell
 # 版本一致性（--all 顺便查 12 个 workspace 成员有没有漂）
-uv run --no-project python scripts/check_version.py v0.1.0 --all
+uv run --no-project python scripts/check_version.py v0.1.1 --all
 
 # 构建 1 个 sdist + 1 个 wheel，并检查元数据与模块齐全
 uv build --out-dir dist

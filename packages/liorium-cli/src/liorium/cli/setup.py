@@ -69,6 +69,18 @@ MEMORY_SHORTCUTS = {
     "extraction": "extraction",
 }
 
+MEMORY_EMBED_FIELDS = {
+    "embed_model": "model",
+    "embed_base_url": "base_url",
+    "embed_key": "api_key",
+}
+"""``embed`` 子配置里"命令行名字 → 字段名"的映射。
+
+以前是 ``token.split("_", 1)[1]`` 现推，``embed_key`` 会被推成 ``key`` —— 与
+``EmbedConfig.api_key`` 的真实字段名不符，写成 profile 后 ``EmbedConfig`` 直接拒绝
+（0.3.0 的 profile 加载失败 bug）。这里显式列出来，名字与 schema 对不上就是 KeyError。
+"""
+
 # ---------------------------------------------------------------------------
 # 上下文
 # ---------------------------------------------------------------------------
@@ -841,7 +853,7 @@ def memory_settings(ctx: Ctx, data: Mapping[str, Any] | None = None) -> dict[str
         "dir": config.get("dir"),
         "embed_model": str(embed.get("model") or ""),
         "embed_base_url": str(embed.get("base_url") or ""),
-        "embed_key": str(embed.get("api_key") or ""),
+        "embed_key": str(embed.get("api_key") or embed.get("key") or ""),
         "vectors": bool(config.get("vectors", True)),
         "extraction": bool(config.get("extraction", True)),
     }
@@ -917,8 +929,9 @@ def memory_set(ctx: Ctx, key: str, value: str) -> int:
         config[token] = parsed
         shown = "开" if parsed else "关"
     else:
-        field = token.split("_", 1)[1]  # model / base_url / key
+        field = MEMORY_EMBED_FIELDS[token]  # model / base_url / api_key
         embed = dict(config.get("embed") or {})
+        legacy_key = embed.pop("key", None)  # 0.3.0 写错的历史字段，读到就顺手修正
         text = str(value).strip()
         if field == "model" and not text:
             config.pop("embed", None)
@@ -929,8 +942,10 @@ def memory_set(ctx: Ctx, key: str, value: str) -> int:
             if field == "model":
                 embed.setdefault("base_url", "https://api.openai.com/v1")
             embed.setdefault("api_key", "")
+            if field != "api_key" and not embed["api_key"] and legacy_key:
+                embed["api_key"] = str(legacy_key)
             config["embed"] = embed
-            shown = cfg.mask_secret(text) if field == "key" else text or "(空)"
+            shown = cfg.mask_secret(text) if field == "api_key" else text or "(空)"
     ctx.save_profile(data)
     if ctx.json_mode:
         ctx.emit_json({f"memory.{token}": shown})
@@ -1008,8 +1023,11 @@ def profile_show(ctx: Ctx) -> int:
     for entry in shown.get("realms") or []:
         config = entry.get("config") if isinstance(entry, dict) else None
         embed = config.get("embed") if isinstance(config, dict) else None
-        if isinstance(embed, dict) and embed.get("api_key"):
-            embed["api_key"] = cfg.mask_secret(embed["api_key"])
+        if isinstance(embed, dict):
+            # ``key`` 是 0.3.0 写错的历史字段：也要打码，否则 profile show 会明码打印。
+            for name in ("api_key", "key"):
+                if embed.get(name):
+                    embed[name] = cfg.mask_secret(embed[name])
 
     status: bool | str = True
     if target.is_file():
@@ -2149,6 +2167,7 @@ __all__ = [
     "Check",
     "Ctx",
     "MEMORY_SHORTCUTS",
+    "MEMORY_EMBED_FIELDS",
     "PROVIDER_THINKING_DIALECTS",
     "WizardResult",
     "build_parser",

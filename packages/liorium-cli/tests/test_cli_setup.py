@@ -257,6 +257,47 @@ def test_memory_set_rejects_other_keys(home: Path) -> None:
         cli_setup.memory_set(ctx, "thinking", "low")
 
 
+def test_memory_set_embed_key_writes_api_key(home: Path) -> None:
+    """0.3.0 回归：``embed-key`` 曾写成 ``embed.key``，写完 profile 就再也 load 不起来。"""
+    ctx, _ = make_ctx(home)
+    assert cli_setup.memory_set(ctx, "embed-key", "sk-embed") == 0
+    assert cli_setup.memory_set(ctx, "embed-model", "text-embedding-3-small") == 0
+
+    data = cli_profile.load_raw(home / "profile.json")
+    embed = cli_profile.find_realm(data, "memory")["config"]["embed"]  # type: ignore[index]
+    assert embed["api_key"] == "sk-embed"
+    assert "key" not in embed
+    assert cli_setup.memory_settings(ctx)["embed_key"] == "sk-embed"
+
+    # 真正的验收标准：写完的东西必须能过 ``AgentProfile.load``（load realm + 校验 Config）。
+    profile = cli_profile.load(home / "profile.json")
+    memory = next(entry for entry in profile.realms if entry.id == "memory")
+    assert memory.config["embed"]["api_key"] == "sk-embed"
+
+
+def test_memory_set_migrates_legacy_embed_key(home: Path) -> None:
+    """旧文件里的 ``embed.key``：读得出来，顺手搬成 ``api_key``，不再让 load 炸。"""
+    data = cli_profile.default_profile(provider_file=str(home / "providers.json"))
+    cli_profile.find_realm(data, "memory")["config"] = {  # type: ignore[index]
+        "embed": {"model": "m", "base_url": "https://x/v1", "api_key": "", "key": "sk-old"}
+    }
+    cli_profile.save_raw(home / "profile.json", data)
+
+    ctx, _ = make_ctx(home)
+    assert cli_setup.memory_settings(ctx)["embed_key"] == "sk-old"
+
+    # 改别的字段时不能把老 key 弄丢
+    assert cli_setup.memory_set(ctx, "embed-base-url", "https://y/v1") == 0
+    embed = cli_profile.find_realm(  # type: ignore[index]
+        cli_profile.load_raw(home / "profile.json"), "memory"
+    )["config"]["embed"]
+    assert "key" not in embed
+    assert embed["api_key"] == "sk-old"
+    assert embed["base_url"] == "https://y/v1"
+
+    cli_profile.load(home / "profile.json")  # 迁移后必须能加载
+
+
 # ---------------------------------------------------------------------------
 # 体检 / 总览 / 命令行入口
 # ---------------------------------------------------------------------------

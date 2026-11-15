@@ -1,6 +1,6 @@
 [project]
 name = "liorium-profile"
-version = "0.3.0"
+version = "0.3.1"
 description = "Liorium Agent Profile：JSON/Pydantic 装配配方 → AgentSpec + realm 工厂 + 模型池"
 readme = "README.md"
 requires-python = ">=3.11"

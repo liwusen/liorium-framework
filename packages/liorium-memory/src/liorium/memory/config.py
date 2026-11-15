@@ -10,17 +10,38 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class EmbedConfig(BaseModel):
-    """OpenAI 兼容 embedding 端点（``OpenAICompatibleEmbeddings`` 的三个必填入参）。"""
+    """OpenAI 兼容 embedding 端点（``OpenAICompatibleEmbeddings`` 的三个必填入参）。
+
+    ``key`` 是 0.3.0 的**历史误写字段**：``setup memory set embed-key`` 把 ``embed_key``
+    截成 ``key`` 写进 profile，而这里的字段叫 ``api_key`` ⇒ 写过一次就再也 load 不起来
+    （``extra="forbid"`` 报 "Extra inputs are not permitted"）。0.3.1 修好了写入端，这里
+    继续接受旧文件里的 ``key`` 并映射到 ``api_key``：严格性（决策 D2）针对的是"用户拼错的
+    键"，不该让我们自己的历史 bug 把旧 profile 全部打死。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     model: str
     base_url: str = "https://api.openai.com/v1"
     api_key: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_legacy_key(cls, data: Any) -> Any:
+        """``key`` → ``api_key``（``api_key`` 已有非空值时以它为准，``key`` 直接丢弃）。"""
+        if not isinstance(data, Mapping) or "key" not in data:
+            return data
+        payload = {name: value for name, value in data.items() if name != "key"}
+        if not payload.get("api_key"):
+            payload["api_key"] = data["key"]
+        return payload
 
 
 class MemoryConfig(BaseModel):

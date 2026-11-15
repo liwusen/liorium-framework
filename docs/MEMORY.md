@@ -263,6 +263,12 @@ liorium-cli setup memory show                  # 看当前记忆配置与库位�
 liorium-cli setup memory disable               # 从 profile 里删掉 memory 条目
 ```
 
+> **0.3.0 → 0.3.1**：0.3.0 的 `setup memory set embed-key` 把字段写成了 `embed.key`（正确名是
+> `embed.api_key`），而 `EmbedConfig` 是 `extra="forbid"` ⇒ 写过一次之后整个 profile 再也
+> load 不起来（`realms[N].config.embed.key: Extra inputs are not permitted`）。0.3.1 修好了写入端，
+> 并且加载时仍然接受旧文件里的 `embed.key`（自动映射到 `api_key`）；下次用
+> `setup memory set ...` 改记忆配置时，文件会被就地修正成 `api_key`。
+
 chat 模型仍走原有 provider 配置：`LIORIUM_PROVIDER_CONFIG` → `<LIORIUM_HOME>/providers.json`
 （默认 `~/.liorium/providers.json`）→ `./providers.json`（`--config` 可显式指定）。
 embedding **不再默认复用** chat provider 的 `base_url` / `key`：realm 看不到 registry，

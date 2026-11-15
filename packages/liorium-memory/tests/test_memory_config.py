@@ -54,6 +54,29 @@ def test_realm_validates_config_on_construction() -> None:
         MemoryRealm(SimpleNamespace(config={"unknown_key": 1}))
 
 
+def test_embed_config_accepts_legacy_key_field() -> None:
+    """0.3.0 把 ``embed.key`` 写进了 profile：0.3.1 必须还能读，并映射成 ``api_key``。"""
+    legacy = MemoryConfig.model_validate(
+        {"embed": {"model": "m", "base_url": "https://x/v1", "api_key": "", "key": "sk-old"}}
+    )
+    assert legacy.embed is not None
+    assert legacy.embed.api_key == "sk-old"
+
+    # 只有 key（连 api_key 都没有）也要能读
+    only_key = MemoryConfig.model_validate({"embed": {"model": "m", "key": "sk-only"}})
+    assert only_key.embed is not None and only_key.embed.api_key == "sk-only"
+
+    # api_key 有值时以它为准，``key`` 直接丢弃（不会覆盖成旧值）
+    both = MemoryConfig.model_validate(
+        {"embed": {"model": "m", "api_key": "sk-new", "key": "sk-old"}}
+    )
+    assert both.embed is not None and both.embed.api_key == "sk-new"
+
+    # 严格性不变：其他拼错的键照样炸（只有 ``key`` 是历史兼容）
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        MemoryConfig.model_validate({"embed": {"model": "m", "keyy": "sk-old"}})
+
+
 async def test_dir_layout_and_owned_store(tmp_path: Path) -> None:
     ctx = make_ctx(tmp_path)
     realm = MemoryRealm(SimpleNamespace(config={"dir": "mem"}))

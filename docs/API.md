@@ -75,7 +75,7 @@
 | `short_fingerprint` | `short_fingerprint(value: Any, length: int = 12) -> str` | 仅用于日志 |
 | `configure` | `configure(level: int \| str \| None = None) -> None` | 给 `liorium` logger 挂 stderr handler，幂等；级别优先级：显式参数 > `LIORIUM_LOG_LEVEL` > `INFO` |
 | `get_logger` | `get_logger(name: str \| None = None) -> logging.Logger` | 取 `liorium.<name>` |
-| `__version__` | `"0.3.0"` | 包版本 |
+| `__version__` | `"0.3.1"` | 包版本 |
 
 异常（全部继承 `LioriumError`）：
 

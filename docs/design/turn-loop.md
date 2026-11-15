@@ -51,11 +51,15 @@ async def _dispatch_runtime_command(websocket, factory) -> tuple[bool, str | Non
 | `on_chat_model_end` | — | 压缩调用 → 关闭压缩卡片；主模型 → 忽略 |
 | `on_tool_start` | `input` | `{"type":"tool_start","tool_name":str,"args":dict,"call_id":str}` |
 | `on_tool_end` | `output` | `{"type":"tool_result","tool_name":str,"output":str \| dict,"call_id":str}` |
+| `on_tool_error` | `error` | `{"type":"tool_result","tool_name":str,"output":"[工具执行出错] <类名>: <消息>","call_id":str}`（与 `on_tool_end` 同一配对逻辑，先到先算） |
 | （取锁成功） | — | `{"type":"lock_acquired"}` |
 
 - `event_name = str(event.get("event") or "").strip().lower()`；AI chunk 用 `is_ai_message_chunk(chunk)` 判定。
 - `tool_name = str(event.get("name") or data.get("name") or "tool").strip()`；`call_id = str(event.get("run_id") or "")`（**用 LangGraph `run_id` 当工具调用 id**，不是模型的 `tool_call_id`）。
 - `args = normalize_tool_args(data.get("input"))`；`output = tool_value_to_text(data.get("output"))`。
+- **工具异常也成对**：工具抛异常时只有 `on_tool_error`（没有配对的 `on_tool_end`），正文用
+  `tool_error_to_text(data.get("error"))` → `[工具执行出错] <类名>: <消息>`。不处理的话 `tool_start`
+  一直悬着，收尾时会被补成 `[已中断]`（文案误导，且排在后续 delta 之后）。
 
 压缩分流：`COMPACT_TAG = "liorium_compact_summarizer"`；压缩调用以 `config={"tags": [COMPACT_TAG], "metadata": {"liorium_event": "compact"}}` 发起。
 生产者本地 `compact_active: bool` + `_close_compact(*, ok: bool = True)`（为真时置假并投 `{"type":"compact_done","ok":ok}`）；
@@ -459,3 +463,21 @@ fixtures：`short_lock_timeout`（`AGENT_LOCK_TIMEOUT = 0.2`）；conftest 的 `
 13. **System 恒在 checkpoint 首位且只有一条**（`REMOVE_ALL_MESSAGES` + 重排 + `as_node="model"`，保留非 System 历史）。
 14. **锁忙 ≠ 运行时损坏**：`status="busy"` 时不得清 `state.agent`；子模型失效只降级子代理。
 15. **token 只取 API 上报值**（反向扫描第一条带 `usage_metadata` 的 `AIMessage`），无值显示 `—`；Anthropic 输入 = `input_tokens + cache_read + cache_creation`，OpenAI/Gemini 的 cached 是子集不重复相加。
+
+## 9. 2026-11-12 补注：本文是旧后端基线，当前实现已事件流原生
+
+本文逐字记录的是**重构前那套后端**（`invoke_agent_locked` / `turn_gate` / `abort_event` /
+`lock_acquired`、`done(forced=True)` 等）。Liorium 当前实现与它的对应关系：
+
+- 回合由常驻 `TurnWorker` 从 `Inbox` 取条目驱动（`runtime/worker.py`），**没有**调用方 `async for`
+  驱动回合的 `run()`；事件经 `EventHub` 扇出给多个 `stream()` 订阅者；
+- 事件出口不再是"单消费者生成器"，本文第 8 节第 4 条"终结事件恰好一次"在 Liorium 里表达为
+  "每个回合恰好一条终态帧（`done` / `interrupted` / `error`），且是该回合最后一条"；
+- 新增**非终态** `round_aborted`：模型轮被 `IMMEDIATE` 插话切掉时发，同一 `turn_id` 继续，
+  **不**发终态帧；`interrupted` / `error` 由 worker 补齐，不再靠消费者捕获异常判断结束；
+- `pending` / `streaming` / `lock_acquired` 这类"排队反馈"事件没有对应物：等待期间零事件，
+  积压看 `status().queue_depth` / `status().pending_by_bucket`；
+- 播放闸门（本文的 `turn_gate.arm()`）不在 Core：v1 没有播报通道，闸门在适配器侧。
+
+其余不变量（单执行位、压缩文本不进正文、system 只有一条、token 只取上报值、中断保留半条消息）
+在 Liorium 侧仍然成立。完整契约见 [`event-stream.md`](event-stream.md)。

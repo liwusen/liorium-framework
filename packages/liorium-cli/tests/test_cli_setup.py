@@ -1,4 +1,4 @@
-"""``setup`` 子命令、``config.json`` 与「未配置」冷启动。"""
+"""``setup`` 子命令、``config.json``（UI-only）、profile 与「未配置」冷启动。"""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from liorium.cli import config as cli_config
+from liorium.cli import profile as cli_profile
 from liorium.cli import setup as cli_setup
 from liorium.cli.app import build_parser, run_cli
 from liorium.cli.providers import ProviderRegistry, load_registry
@@ -34,6 +35,7 @@ def make_ctx(home: Path, answers: list[str] | None = None) -> tuple[cli_setup.Ct
     ctx = cli_setup.Ctx(
         providers=home / "providers.json",
         config_file=home / "config.json",
+        profile=home / "profile.json",
         input_fn=ask,
         print_fn=lines.append,
     )
@@ -41,44 +43,41 @@ def make_ctx(home: Path, answers: list[str] | None = None) -> tuple[cli_setup.Ct
 
 
 # ---------------------------------------------------------------------------
-# config.json
+# config.json（只剩 UI）
 # ---------------------------------------------------------------------------
 
 
 def test_config_defaults_and_coercion(home: Path) -> None:
     config = cli_config.load_config()
-    assert config["thinking"] == "medium"
-    assert config["memory"]["enabled"] is True
-    assert config["ui"]["color"] is True
+    assert set(config) == {"version", "ui"}
+    assert config["ui"] == {"color": True, "hide_reasoning": False}
 
-    assert cli_config.set_value(config, "thinking", "low") == "low"
-    assert cli_config.set_value(config, "memory.enabled", "no") is False
-    assert cli_config.set_value(config, "memory.dir", " D:/mem ") == "D:/mem"
-    assert cli_config.set_value(config, "memory.vectors", "1") is True
-    assert cli_config.set_value(config, "memory.embed_key", "") is None
+    assert cli_config.set_value(config, "ui.color", "no") is False
+    assert cli_config.set_value(config, "ui.hide_reasoning", "1") is True
 
     with pytest.raises(cli_config.ConfigError, match="未知配置键"):
-        cli_config.set_value(config, "memory.nope", 1)
-    with pytest.raises(cli_config.ConfigError, match="off/low/medium/high"):
-        cli_config.set_value(config, "thinking", "turbo")
+        cli_config.set_value(config, "ui.nope", 1)
+    # 装配键已经迁到 profile：这里要明确指向 profile，而不是静默接受
+    with pytest.raises(cli_config.ConfigError, match="profile"):
+        cli_config.set_value(config, "thinking", "low")
     with pytest.raises(cli_config.ConfigError, match="布尔"):
-        cli_config.set_value(config, "memory.enabled", "maybe")
+        cli_config.set_value(config, "ui.color", "maybe")
 
 
 def test_config_roundtrip_preserves_unknown_keys(home: Path) -> None:
     path = cli_config.config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"thinking": "high", "未来字段": 42}), encoding="utf-8")
+    path.write_text(json.dumps({"ui": {"color": False}, "未来字段": 42}), encoding="utf-8")
 
     config = cli_config.load_config()
-    assert config["thinking"] == "high"
+    assert config["ui"]["color"] is False
+    assert config["ui"]["hide_reasoning"] is False  # 缺的键用默认补齐
     assert config["未来字段"] == 42
-    assert config["memory"]["enabled"] is True  # 缺的键用默认补齐
 
-    cli_config.set_value(config, "model", "p::m")
+    cli_config.set_value(config, "ui.hide_reasoning", "yes")
     cli_config.save_config(config)
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["model"] == "p::m"
+    assert saved["ui"]["hide_reasoning"] is True
     assert saved["未来字段"] == 42
 
 
@@ -93,7 +92,7 @@ def test_config_rejects_broken_files(home: Path) -> None:
     with pytest.raises(cli_config.ConfigError, match="顶层"):
         cli_config.load_config()
 
-    assert cli_config.load_config(home / "missing.json")["thinking"] == "medium"
+    assert cli_config.load_config(home / "missing.json")["ui"]["color"] is True
     with pytest.raises(cli_config.ConfigError, match="不存在"):
         cli_config.load_config(home / "missing.json", missing_ok=False)
 
@@ -103,7 +102,7 @@ def test_ensure_home_creates_empty_skeleton(home: Path) -> None:
     assert created["config"] == cli_config.config_path()
     assert created["providers"] == cli_config.providers_path()
     assert json.loads(created["providers"].read_text(encoding="utf-8")) == {"providers": []}
-    assert json.loads(created["config"].read_text(encoding="utf-8"))["thinking"] == "medium"
+    assert set(json.loads(created["config"].read_text(encoding="utf-8"))) == {"version", "ui"}
 
     again = cli_config.ensure_home()
     assert again["config"] is None and again["providers"] is None  # 不覆盖已有文件
@@ -228,13 +227,13 @@ def test_memory_commands(home: Path, tmp_path: Path) -> None:
     assert cli_setup.memory_set(ctx, "dir", str(target)) == 0
     assert cli_setup.memory_set(ctx, "embed-model", "text-embedding-3-small") == 0
     assert cli_setup.memory_set(ctx, "vectors", "off") == 0
-    assert cli_setup.memory_enable(ctx, False) == 0
 
-    config = cli_config.load_config(ctx.config_file)
-    assert config["memory"]["dir"] == str(target)
-    assert config["memory"]["embed_model"] == "text-embedding-3-small"
-    assert config["memory"]["enabled"] is False
-    assert config["memory"]["vectors"] is False
+    data = cli_profile.load_raw(home / "profile.json")
+    config = cli_profile.find_realm(data, "memory")["config"]
+    assert config["dir"] == str(target)
+    assert config["embed"]["model"] == "text-embedding-3-small"
+    assert config["vectors"] is False
+    assert cli_setup.memory_settings(ctx)["enabled"] is True
 
     assert cli_setup.memory_show(ctx) == 0
     assert any("text-embedding-3-small" in line for line in lines)
@@ -246,8 +245,10 @@ def test_memory_commands(home: Path, tmp_path: Path) -> None:
     assert (target / "memory.sqlite").is_file()
     assert (target / "content").is_dir()
 
+    assert cli_setup.memory_enable(ctx, False) == 0
+    assert cli_profile.find_realm(cli_profile.load_raw(home / "profile.json"), "memory") is None
     assert cli_setup.memory_enable(ctx, True) == 0
-    assert cli_config.load_config(ctx.config_file)["memory"]["enabled"] is True
+    assert cli_setup.memory_settings(ctx)["enabled"] is True
 
 
 def test_memory_set_rejects_other_keys(home: Path) -> None:
@@ -327,13 +328,17 @@ def test_setup_main_errors_return_2(home: Path, capsys) -> None:
 
 
 def test_setup_config_set_get_unset(home: Path, capsys) -> None:
-    assert cli_setup.main(["set", "thinking", "low"]) == 0
+    assert cli_setup.main(["set", "ui.color", "0"]) == 0
     capsys.readouterr()
-    assert cli_config.load_config()["thinking"] == "low"
-    assert cli_setup.main(["get", "thinking"]) == 0
-    assert capsys.readouterr().out.strip().endswith("low")
-    assert cli_setup.main(["unset", "thinking"]) == 0
-    assert cli_config.load_config()["thinking"] == "medium"
+    assert cli_config.load_config()["ui"]["color"] is False
+    assert cli_setup.main(["get", "ui.color"]) == 0
+    assert capsys.readouterr().out.strip().endswith("关")
+    assert cli_setup.main(["unset", "ui.color"]) == 0
+    assert cli_config.load_config()["ui"]["color"] is True
+
+    # 装配键会被明确拒绝，并指向 profile
+    assert cli_setup.main(["set", "thinking", "low"]) == 2
+    assert "profile" in capsys.readouterr().err
 
 
 def test_app_main_dispatches_setup(home: Path, capsys) -> None:
@@ -345,29 +350,159 @@ def test_app_main_dispatches_setup(home: Path, capsys) -> None:
 
 
 # ---------------------------------------------------------------------------
+# setup profile
+# ---------------------------------------------------------------------------
+
+
+def _write_profile(home: Path, **updates) -> Path:
+    data = cli_profile.default_profile(provider_file=str(home / "providers.json"))
+    data.update(updates)
+    return cli_profile.save_raw(home / "profile.json", data)
+
+
+def test_setup_profile_show_fills_defaults_and_masks(home: Path, capsys) -> None:
+    data = cli_profile.default_profile(provider_file=str(home / "providers.json"))
+    cli_profile.find_realm(data, "memory")["config"] = {  # type: ignore[index]
+        "embed": {"model": "m", "api_key": "sk-1234567890"}
+    }
+    cli_profile.save_raw(home / "profile.json", data)
+
+    assert cli_setup.main(["--json", "profile", "show"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    shown = payload["profile"]
+    assert payload["exists"] is True and payload["valid"] is True
+    assert shown["inbox"] == ".liorium-cli/agent"  # 默认值补齐
+    assert shown["thinking"] == "medium"
+    assert shown["realms"][1]["config"]["embed"]["api_key"] != "sk-1234567890"
+
+    # 人类可读输出同样打码
+    assert cli_setup.main(["profile", "show"]) == 0
+    out = capsys.readouterr().out
+    assert "sk-1234567890" not in out
+    assert "sk-1" in out
+
+
+def test_setup_profile_path_and_init(home: Path, capsys) -> None:
+    assert cli_setup.main(["profile", "path"]) == 0
+    assert str(home / "profile.json") in capsys.readouterr().out
+
+    assert cli_setup.main(["profile", "init"]) == 0
+    capsys.readouterr()
+    profile_path = home / "profile.json"
+    assert profile_path.is_file()
+    created = cli_profile.load_raw(profile_path)
+    assert created["provider_file"] == str(home / "providers.json")
+
+    # 已存在 ⇒ 不覆盖
+    created["model"] = "keep::me"
+    cli_profile.save_raw(profile_path, created)
+    assert cli_setup.main(["profile", "init"]) == 0
+    assert "已存在" in capsys.readouterr().out
+    assert cli_profile.load_raw(profile_path)["model"] == "keep::me"
+
+    # --force 才重写
+    assert cli_setup.main(["profile", "init", "--force"]) == 0
+    assert cli_profile.load_raw(profile_path)["model"] is None
+
+
+def test_setup_profile_init_template(home: Path, tmp_path: Path) -> None:
+    template = tmp_path / "template.json"
+    data = cli_profile.default_profile(provider_file=str(tmp_path / "p.json"))
+    data["id"] = "template"
+    data["thinking"] = "high"
+    cli_profile.save_raw(template, data)
+
+    assert cli_setup.main(["profile", "init", "--template", str(template)]) == 0
+    copied = cli_profile.load_raw(home / "profile.json")
+    assert copied["id"] == "template"
+    assert copied["thinking"] == "high"
+
+
+def test_setup_profile_validate(home: Path, capsys) -> None:
+    _write_profile(home)
+    assert cli_setup.main(["--json", "profile", "validate"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+
+    # 结构错误：路径要能指到出错字段
+    bad = home / "profile.json"
+    bad.write_text('{"version": 2}', encoding="utf-8")
+    assert cli_setup.main(["profile", "validate"]) == 2
+    assert "version" in capsys.readouterr().out
+
+    # realm 导入失败：完整 load 报错，--schema-only 放行
+    data = cli_profile.default_profile(provider_file=str(home / "providers.json"))
+    data["realms"][0]["source"] = "liorium.nope:Nope"
+    cli_profile.save_raw(bad, data)
+    assert cli_setup.main(["profile", "validate"]) == 2
+    assert "liorium.nope" in capsys.readouterr().out
+    assert cli_setup.main(["profile", "validate", "--schema-only"]) == 0
+    capsys.readouterr()
+
+    # --provider：provider_file 不存在 ⇒ 失败
+    good = cli_profile.default_profile(provider_file=str(home / "missing.json"))
+    cli_profile.save_raw(bad, good)
+    assert cli_setup.main(["profile", "validate", "--provider"]) == 2
+    assert "missing.json" in capsys.readouterr().out
+
+
+def test_setup_profile_migrate(home: Path, capsys) -> None:
+    old = cli_config.default_config()
+    old["model"] = "P::m"
+    home.mkdir(parents=True, exist_ok=True)
+    cli_config.save_config(old, home / "config.json")
+
+    assert cli_setup.main(["profile", "migrate"]) == 0
+    out = capsys.readouterr().out
+    assert "已迁移" in out
+    assert (home / "config.json.bak").is_file()
+    assert cli_profile.load_raw(home / "profile.json")["model"] == "P::m"
+    assert set(json.loads((home / "config.json").read_text(encoding="utf-8"))) == {
+        "version",
+        "ui",
+    }
+
+    # 第二次：profile 已存在 ⇒ 非零（不静默成功）
+    assert cli_setup.main(["profile", "migrate"]) == 1
+    assert "已存在" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # 空配置启动
 # ---------------------------------------------------------------------------
 
 
-def test_build_parser_reads_config_defaults(home: Path) -> None:
-    config = cli_config.default_config()
-    cli_config.set_value(config, "thinking", "low")
-    cli_config.set_value(config, "memory.enabled", False)
-    cli_config.set_value(config, "memory.dir", "D:/mem")
-    cli_config.set_value(config, "model", "p::m")
-    cli_config.set_value(config, "workspace", "D:/ws")
-    cli_config.set_value(config, "ui.color", False)
+def test_build_parser_reads_config_and_profile_defaults(home: Path, tmp_path: Path) -> None:
+    """显示偏好来自 config.json，装配默认值来自 profile（G1）。"""
+    from liorium.profile import AgentProfile
 
+    config = cli_config.default_config()
+    cli_config.set_value(config, "ui.color", False)
     args = build_parser(config=config).parse_args([])
-    assert args.thinking == "low"
-    assert args.no_memory is True
-    assert Path(args.memory_dir) == Path("D:/mem")
-    assert args.model == "p::m"
-    assert Path(args.workspace) == Path("D:/ws")
     assert args.no_color is True
 
-    # 命令行仍然最高
-    assert build_parser(config=config).parse_args(["--thinking", "high"]).thinking == "high"
+    data = cli_profile.default_profile()
+    data.update({"thinking": "low", "model": "p::m", "workspace": "D:/ws", "temperature": 0.5})
+    data["limits"] = {"max_turns": 7}
+    profile = AgentProfile.from_dict(data, base_dir=tmp_path)
+
+    args = build_parser(config=config, profile=profile).parse_args([])
+    assert args.thinking == "low"
+    assert args.model == "p::m"
+    assert args.temperature == 0.5
+    assert args.max_turns == 7
+    assert args.no_color is True
+    # workspace / inbox 的 flag 是"本次覆盖"，默认 None ⇒ 由 app 从 profile 解析
+    assert args.workspace is None
+    from liorium.cli.app import _resolve_inbox, _resolve_workspace
+
+    assert _resolve_workspace(args, profile) == Path("D:/ws")
+    assert _resolve_inbox(args, profile, Path("D:/ws")) == Path("D:/ws/.liorium-cli/agent")
+
+    # 命令行仍然最高；结构性 flag 已经不存在（只在 profile 里）
+    assert build_parser(config=config, profile=profile).parse_args(["--thinking", "high"]).thinking == "high"
+    assert not hasattr(args, "memory_dir")
+    assert not hasattr(args, "tools")
 
 
 def test_load_registry_treats_empty_config_as_unconfigured(home: Path) -> None:
@@ -379,6 +514,47 @@ def test_load_registry_treats_empty_config_as_unconfigured(home: Path) -> None:
 
     registry, tried = load_registry(home / "providers.json")
     assert registry is None
+
+
+@pytest.mark.asyncio
+async def test_run_cli_migrates_old_config(home: Path, tmp_path: Path, capsys) -> None:
+    """首次启动：旧 config.json 的装配字段迁到 profile，原文件变 UI-only + .bak。"""
+    from test_cli_agent import stub_factory, write_config
+
+    config_path = write_config(tmp_path)
+    old = cli_config.default_config()
+    old["model"] = "stub::demo"
+    old["thinking"] = "high"
+    home.mkdir(parents=True, exist_ok=True)
+    cli_config.save_config(old, home / "config.json")
+
+    code = await run_cli(
+        [
+            "--config",
+            str(config_path),
+            "-p",
+            "你好",
+            "--json",
+            "--workspace",
+            str(tmp_path / "ws"),
+            "--inbox",
+            str(tmp_path / "inbox"),
+        ],
+        model_factory=stub_factory(["迁移后回复"]),
+        install_signal=False,
+    )
+    assert code == 0
+
+    profile_data = cli_profile.load_raw(home / "profile.json")
+    assert profile_data["model"] == "stub::demo"
+    assert profile_data["thinking"] == "high"
+    assert profile_data["provider_file"] == str(config_path)
+    assert (home / "config.json.bak").is_file()
+    assert set(json.loads((home / "config.json").read_text(encoding="utf-8"))) == {
+        "version",
+        "ui",
+    }
+    assert "迁移" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio
@@ -395,6 +571,7 @@ async def test_cold_start_creates_files_and_repl_works(home: Path, capsys) -> No
         "providers": []
     }
     assert json.loads((home / "config.json").read_text(encoding="utf-8"))["version"] == 1
+    assert (home / "profile.json").is_file()  # 首次启动就生成默认 profile
     out = capsys.readouterr().out
     assert "还没有配置 provider" in out
     assert "/setup" in out
@@ -467,6 +644,7 @@ async def test_wizard_provider_edit_and_remove(home: Path) -> None:
 
 
 def test_wizard_memory_toggles(home: Path, tmp_path: Path) -> None:
+    """向导改的是 profile 里 memory realm 的 config（不再是 config.json）。"""
     ctx, lines = make_ctx(
         home,
         [
@@ -474,7 +652,6 @@ def test_wizard_memory_toggles(home: Path, tmp_path: Path) -> None:
             str(tmp_path / "mem"),
             "2",                       # embed 模型
             "text-embedding-3-small",
-            "5",                       # 开关记忆
             "0",                       # 返回
         ],
     )
@@ -482,11 +659,20 @@ def test_wizard_memory_toggles(home: Path, tmp_path: Path) -> None:
     assert result.memory_changed is True
     assert result.memory_dir_changed is True
     assert result.memory_embed_changed is True
-    assert result.memory_enabled is False
-    config = cli_config.load_config(ctx.config_file)
-    assert config["memory"]["dir"] == str(tmp_path / "mem")
-    assert config["memory"]["embed_model"] == "text-embedding-3-small"
-    assert config["memory"]["enabled"] is False
+
+    data = cli_profile.load_raw(home / "profile.json")
+    config = cli_profile.find_realm(data, "memory")["config"]
+    assert config["dir"] == str(tmp_path / "mem")
+    assert config["embed"]["model"] == "text-embedding-3-small"
+    assert cli_config.load_config(ctx.config_file) == cli_config.default_config()
+
+    # 再跑一次向导关掉记忆 ⇒ 直接删掉 realm 条目
+    settings = cli_setup.memory_settings(ctx)
+    assert settings["enabled"] is True
+    ctx_off, _ = make_ctx(home, ["5", "0"])
+    disabled = cli_setup.wizard_memory(ctx_off)
+    assert disabled.memory_enabled is False
+    assert cli_profile.find_realm(cli_profile.load_raw(home / "profile.json"), "memory") is None
 
 
 @pytest.mark.asyncio
@@ -516,10 +702,15 @@ async def test_setup_command_in_session_adds_provider_and_switches(
         ]
     )
     registry = ProviderRegistry.load(home / "providers.json")
+    profile_data = cli_profile.default_profile(provider_file=str(home / "providers.json"))
+    cli_profile.find_realm(profile_data, "memory")["config"] = {"extraction": False}  # type: ignore[index]
+    profile_path = home / "profile.json"
+    cli_profile.save_raw(profile_path, profile_data)
     options = CliOptions(
         workspace=write_workspace(tmp_path / "ws"),
         inbox=tmp_path / "inbox",
         color=False,
+        profile_path=profile_path,
         config_file=home / "config.json",
         providers_file=home / "providers.json",
         models_dev_cache=tmp_path / "cache" / "api.json",

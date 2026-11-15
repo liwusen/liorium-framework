@@ -27,7 +27,7 @@ agent = LioriumAgent(
 节奏按 spec 覆盖（`params` 进 spec 指纹 ⇒ 改节奏会触发 `apply()`）：
 
 ```python
-realms=[RealmSpec(id="todo", params={"context_every": 10, "context_first": False})]
+realms=[RealmSpec(id="todo", config={"context_every": 10, "context_first": False})]
 ```
 
 ## 两个工具
@@ -45,6 +45,25 @@ todo(action="remove", id="t1")                      → 已删除 t1：写周报
 ```
 
 失败一律返回 `错误：…` 文本（不抛异常、不中断回合）——模型看得到原因，能自己改参数。
+
+## 宿主消息：不经模型直接改待办（2026-11-14）
+
+外部主程序（GUI / webhook / cron）可以绕过模型直接把改动交给这个 realm，并拿到结果：
+
+```python
+reply = await agent.send_to_realm("todo", "todo.add", {"text": "写周报"})
+# → "已添加 t1 [pending] 写周报"（与工具返回值一致）
+
+await agent.send_to_realm("todo", "todo.update", {"id": "t1", "status": "finished"})
+await agent.send_to_realm("todo", "todo.remove", {"id": "t1"})
+await agent.send_to_realm("todo", "todo.list", {"include_finished": False})
+```
+
+- 名字只看最后一段（`todo.add` / `host.todo.add` 都行），支持
+  `add` / `update` / `remove` / `list` 四个动作；不认识的抛 `RealmError`；
+- 每次改动照常触发 `realm` 事件帧 `todo.changed`（`counts` + `ids`），宿主 UI 可以直接刷新；
+- 业务错误仍按既有约定返回 `错误：…` 文本（不抛），与工具行为一致；
+- 调用在宿主 task 里立即执行（不等回合结束），详见 [`docs/EXTENDING.md` §1.6](../../docs/EXTENDING.md)。
 
 ## 四个状态
 

@@ -21,6 +21,7 @@ members = [
     "liorium-core-tool-realm",
     "liorium-mcp",
     "liorium-memory",
+    "liorium-profile",
     "liorium-provider-manager",
     "liorium-realm-base",
     "liorium-skills",
@@ -1004,6 +1005,7 @@ dev = [
     { name = "liorium-core-tool-realm" },
     { name = "liorium-mcp" },
     { name = "liorium-memory", extra = ["vector"] },
+    { name = "liorium-profile" },
     { name = "liorium-provider-manager", extra = ["all"] },
     { name = "liorium-realm-base" },
     { name = "liorium-skills" },
@@ -1050,6 +1052,7 @@ dev = [
     { name = "liorium-core-tool-realm", editable = "packages/liorium-core-tool-realm" },
     { name = "liorium-mcp", editable = "packages/liorium-mcp" },
     { name = "liorium-memory", extras = ["vector"], editable = "packages/liorium-memory" },
+    { name = "liorium-profile", editable = "packages/liorium-profile" },
     { name = "liorium-provider-manager", extras = ["all"], editable = "packages/liorium-provider-manager" },
     { name = "liorium-realm-base", editable = "packages/liorium-realm-base" },
     { name = "liorium-skills", editable = "packages/liorium-skills" },
@@ -1149,12 +1152,14 @@ version = "0.1.1"
 source = { editable = "packages/liorium-cli" }
 dependencies = [
     { name = "liorium-agent", extra = ["core", "memory-vector", "skills", "todo"] },
+    { name = "liorium-profile" },
     { name = "liorium-provider-manager", extra = ["all"] },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "liorium-agent", extras = ["core", "memory-vector", "skills", "todo"], editable = "packages/liorium-agent" },
+    { name = "liorium-profile", editable = "packages/liorium-profile" },
     { name = "liorium-provider-manager", extras = ["all"], editable = "packages/liorium-provider-manager" },
 ]
 
@@ -1224,6 +1229,7 @@ dependencies = [
     { name = "langchain-core" },
     { name = "liorium-core" },
     { name = "liorium-vfs" },
+    { name = "pydantic" },
 ]
 
 [package.optional-dependencies]
@@ -1242,8 +1248,26 @@ requires-dist = [
     { name = "liorium-vfs", editable = "packages/liorium-vfs" },
     { name = "nano-vectordb", marker = "extra == 'vector'", specifier = "==0.0.4.3" },
     { name = "numpy", marker = "extra == 'vector'", specifier = ">=2" },
+    { name = "pydantic", specifier = ">=2.7,<3" },
 ]
 provides-extras = ["vector"]
+
+[[package]]
+name = "liorium-profile"
+version = "0.1.1"
+source = { editable = "packages/liorium-profile" }
+dependencies = [
+    { name = "liorium-agent" },
+    { name = "liorium-provider-manager" },
+    { name = "pydantic" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "liorium-agent", editable = "packages/liorium-agent" },
+    { name = "liorium-provider-manager", editable = "packages/liorium-provider-manager" },
+    { name = "pydantic", specifier = ">=2.7,<3" },
+]
 
 [[package]]
 name = "liorium-provider-manager"

@@ -15,6 +15,7 @@ from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResu
 from liorium.agent import AgentSpec, Limits, LioriumAgent
 from liorium.agent.runtime.middleware import build_chain
 from liorium.agent.runtime.output_store import OutputStore
+from liorium_testkit import collect_turn
 
 
 def is_model_retry_middleware(middleware: Any) -> bool:
@@ -82,7 +83,7 @@ async def test_retry_recovers_from_transient_error(agent_workspace: Path) -> Non
     agent = LioriumAgent(spec=spec, model_factory=lambda _l: model)
     await agent.start()
     try:
-        events = [e async for e in agent.run("你好")]
+        events = await collect_turn(agent, "你好")
         assert events[-1].type == "done"
         assert any(e.type == "delta" for e in events)
         assert model.calls == 2, f"应重试一次，实际调用 {model.calls} 次"
@@ -92,8 +93,6 @@ async def test_retry_recovers_from_transient_error(agent_workspace: Path) -> Non
 
 @pytest.mark.asyncio
 async def test_retry_gives_up_after_max_attempts(agent_workspace: Path) -> None:
-    from liorium.core.errors import TurnError
-
     model = FlakyChatModel(fail_times=99)
     spec = AgentSpec(
         id="retry-fail",
@@ -106,9 +105,11 @@ async def test_retry_gives_up_after_max_attempts(agent_workspace: Path) -> None:
     agent = LioriumAgent(spec=spec, model_factory=lambda _l: model)
     await agent.start()
     try:
-        with pytest.raises(TurnError) as info:
-            _ = [e async for e in agent.run("你好")]
-        assert "429" in str(info.value) or "ConnectionError" in str(info.value)
+        events = await collect_turn(agent, "你好")
+        terminal = events[-1]
+        assert terminal.type == "error"
+        error = str(terminal.get("error") or "")
+        assert "429" in error or "ConnectionError" in error
         assert model.calls >= 2
     finally:
         await agent.close()

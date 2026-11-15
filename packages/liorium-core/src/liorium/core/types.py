@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, Union
 
@@ -163,11 +164,29 @@ AGENT_EVENT_TYPES = (
     "compact_delta",
     "compact_done",
     "done",
+    "round_aborted",
+    "interrupted",
+    "error",
+    "input",
+    "realm",
 )
-"""``run()`` 产出的事件类型（计划 §3.5 表第一段）。
+"""Agent 事件类型总表（事件流原生化后共 14 种）。
 
-2026-11-08 起不再有「宿主事件」：``run()`` 返回的生成器是唯一事件出口，
-等待 / 中断 / 失败分别用「不产出事件」「``TurnInterrupted``」「``TurnError``」表达。
+前 9 种是回合内的正文/工具/压缩/完成帧，保持顺序不变；后 4 种是事件流
+新增的模型轮中断、回合终态与入站生命周期帧：
+
+- ``round_aborted``：模型轮被抢占（非终态）；
+- ``interrupted``：回合被抢占 / 用户中断 / 关闭而终止（终态）；
+- ``error``：回合因异常终止（终态）；
+- ``input``：入站条目的生命周期（``accepted`` / ``delivered`` / ``expired`` / ``dropped``）。
+
+最后一种是 realm 主动推送（2026-11-14 追加，**只在尾部追加、不打乱前 13 种的顺序**）：
+
+- ``realm``：realm 自己发出的事件（``realm`` / ``name`` / ``data``），**永远不是终态帧**，
+  也不开回合；回合内发出的带 ``turn_id``。
+
+硬规则：每个回合恰好一条终态帧（``done`` / ``interrupted`` / ``error``），
+且是该回合最后一条事件。
 """
 
 ALL_EVENT_TYPES = AGENT_EVENT_TYPES
@@ -200,8 +219,12 @@ class Event:
         return self.payload.get(key, default)
 
 
-def ev_start(turn_id: str) -> Event:
-    return Event("start", {"turn_id": turn_id})
+def ev_start(turn_id: str, *, origin: str = "user", inputs: Sequence[str] = ()) -> Event:
+    """回合开始帧：带回合 id、来源与触发本回合的入站 id 列表。"""
+    return Event(
+        "start",
+        {"turn_id": turn_id, "origin": origin, "inputs": list(inputs)},
+    )
 
 
 def ev_delta(content: str) -> Event:
@@ -236,6 +259,48 @@ def ev_done(turn_id: str) -> Event:
     return Event("done", {"turn_id": turn_id})
 
 
+def ev_round_aborted(turn_id: str, reason: str = "preempted") -> Event:
+    """模型轮被切帧（非终态）：v1 的 ``reason`` 只有 ``preempted``。"""
+    return Event("round_aborted", {"turn_id": turn_id, "reason": reason})
+
+
+def ev_interrupted(turn_id: str, reason: str) -> Event:
+    """回合被中断的终态帧：``reason`` 取 ``preempted`` / ``user`` / ``close``。"""
+    return Event("interrupted", {"turn_id": turn_id, "reason": reason})
+
+
+def ev_error(turn_id: str, error: str) -> Event:
+    """回合因异常终止的终态帧：``error`` 是 ``"类名: 消息"``，不带 traceback。"""
+    return Event("error", {"turn_id": turn_id, "error": error})
+
+
+def ev_input(input_id: str, state: str, turn_id: str | None = None) -> Event:
+    """入站条目生命周期帧：``id`` / ``state`` 恒有，``turn_id`` 只在已知时写入。"""
+    payload: dict[str, Any] = {"id": input_id, "state": state}
+    if turn_id is not None:
+        payload["turn_id"] = turn_id
+    return Event("input", payload)
+
+
+def ev_realm(
+    realm: str,
+    name: str,
+    data: dict[str, Any] | None = None,
+    turn_id: str | None = None,
+) -> Event:
+    """realm 推送的事件帧（2026-11-14）：**非终态、不开回合**。
+
+    - ``realm``：谁发的（``RealmContext.realm_id``）；
+    - ``name``：事件名（``todo.changed`` 这类，realm 自己定义）；
+    - ``data``：JSON 可序列化的附加数据（前端直接消费，别塞不透明对象）；
+    - ``turn_id``：只有从回合任务的上下文里发出的才带（后台任务通常没有）。
+    """
+    payload: dict[str, Any] = {"realm": realm, "name": name, "data": dict(data or {})}
+    if turn_id is not None:
+        payload["turn_id"] = turn_id
+    return Event("realm", payload)
+
+
 __all__ = [
     "AGENT_EVENT_TYPES",
     "ALL_EVENT_TYPES",
@@ -256,7 +321,12 @@ __all__ = [
     "ev_compact_start",
     "ev_delta",
     "ev_done",
+    "ev_error",
+    "ev_input",
+    "ev_interrupted",
+    "ev_realm",
     "ev_reasoning_delta",
+    "ev_round_aborted",
     "ev_start",
     "ev_tool_result",
     "ev_tool_start",

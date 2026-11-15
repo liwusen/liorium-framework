@@ -3,8 +3,8 @@
 Liorium 的官方命令行 Agent：真实模型 + realm 能力包（核心工具 / 长期记忆 / 技能 / 待办 /
 子代理），流式渲染、`/model` 热切换、Ctrl+C 中断。
 
-六个核心工具由 `core` realm（`liorium-core-tool-realm`）提供：默认装配，`--no-core-tools`
-关掉，`--tools read,find` 只要子集。工具全部来自 realm，Agent 本身不带工具。
+六个核心工具由 `core` realm（`liorium-core-tool-realm`）提供：默认装配；只要子集就在 profile 的
+`toolsets.default` 里列出来，删掉 core 条目则一个都不装。工具全部来自 realm，Agent 本身不带工具。
 
 ## 安装与启动
 
@@ -28,17 +28,22 @@ echo "总结 README" | liorium-cli --json
 OpenRouter / 本地 vLLM 这类端点装完就能用；Anthropic / Google 协议需要
 `liorium[anthropic]` / `liorium[google]`（或一次装 `liorium[all]`）。
 
-## 配置（provider / 记忆系统）
+## 配置（provider / profile / UI）
 
-两个文件，都**可以不存在**；缺省时用内置默认，启动不会因配置缺失失败：
+三个文件，都**可以不存在**；缺省时用内置默认，启动不会因配置缺失失败：
 
 | 文件 | 内容 |
 |---|---|
 | `~/.liorium/providers.json` | provider / key / base_url / 每模型格式 / 上下文长度 / 思考方言（0600） |
-| `~/.liorium/config.json` | 非密钥设置：默认模型、思考强度、工作区、记忆（目录 / embedding / 开关）、技能、UI |
+| `~/.liorium/profile.json` | **Agent 装配**：模型、thinking、温度、工作区 / inbox、提示词、realm 清单与每个 realm 的 config、工具集 |
+| `~/.liorium/config.json` | 只剩 UI 偏好：`ui.color` / `ui.hide_reasoning` |
 
-优先级：**命令行 > 进程环境变量 > `./.env` > `config.json` > 内置默认**；`LIORIUM_HOME`
-可以整体换掉配置根目录（多套配置 / 测试）。
+优先级：**命令行 > 进程环境变量 > `./.env` > `profile.json` / `config.json` > 内置默认**；
+`LIORIUM_HOME` 可以整体换掉配置根目录（多套配置 / 测试）。profile 的查找顺序：
+`--profile` > `./.liorium/profile.json` > `~/.liorium/profile.json`（首次启动自动生成默认模板）。
+
+结构性的东西（记忆目录、工具子集、realm 开关）**只在 profile 里**；命令行 flag 只覆盖本次运行，
+绝不写回文件。`config.json` 里的装配键在迁移时被搬走；再 `setup set` 这些键会被拒绝并指向 profile。
 
 ### 命令行配置
 
@@ -66,7 +71,14 @@ liorium-cli setup memory set vectors off
 liorium-cli setup memory enable / disable
 liorium-cli setup memory init                     # 建目录 + 空记忆库
 
-liorium-cli setup set thinking low                # 其余设置：get / set / unset
+liorium-cli setup profile show                    # 装配全景（默认值补齐、密钥打码）
+liorium-cli setup profile path                    # profile 文件位置
+liorium-cli setup profile init [--template X]     # 生成默认 / 复制模板（已存在不覆盖）
+liorium-cli setup profile validate [--schema-only] [--provider]
+liorium-cli setup profile edit                    # 用 $EDITOR 打开
+liorium-cli setup profile migrate                 # 手动迁移旧 config.json（一次性）
+
+liorium-cli setup set ui.color 0                  # display 偏好：get / set / unset
 liorium-cli setup --json show                     # 脚本化：JSON 输出
 ```
 
@@ -75,7 +87,43 @@ liorium-cli setup --json show                     # 脚本化：JSON 输出
 - 写入**原子**（临时文件 + `os.replace`，0600），写失败会报错，不会假装成功；
 - `add` 的失败不会留下半个 provider；重名 / 非法 URL / 未知格式 / 非法上下文一律拒绝并给出可用值；
 - 第一个 provider 自动成为默认模型；`rm` 掉默认 provider 时自动回退到下一个可用模型；
-- 密钥只进 `providers.json`，`config.json` 里只有 `memory.embed_key`（显示时打码）。
+- 密钥只进 `providers.json`（0600）；`profile.json` 里若写了 `embed.api_key`，`show` 会打码
+  ——不想落盘就用 `${OPENAI_API_KEY}`。
+
+### profile.json 里有什么
+
+默认模板（首次启动生成）是 core / memory / skills / todo / subagents 五件套：
+
+```json
+{
+  "version": 1,
+  "id": "cli",
+  "provider_file": "C:/Users/me/.liorium/providers.json",
+  "model": null,
+  "thinking": "medium",
+  "temperature": 0.3,
+  "workspace": null,
+  "inbox": ".liorium-cli/agent",
+  "prompt": ["AGENT.md"],
+  "toolsets": {},
+  "realms": [
+    {"id": "core", "source": "liorium.core_tool_realm:CoreToolRealm"},
+    {"id": "memory", "source": "liorium.memory:MemoryRealm",
+     "config": {"dir": "D:/data/memory", "extraction": false}},
+    {"id": "skills", "source": "liorium.skills:SkillsRealm"},
+    {"id": "todo", "source": "liorium.todo_realm:TodoRealm"},
+    {"id": "subagents"}
+  ]
+}
+```
+
+- `model` 为 `null` ⇒ 跟随 provider 的 `main_model`；`--model` / `--provider` 只覆盖本次运行；
+- `realms[].source`：`pkg.mod:Class` 或相对 profile 目录的 `./file.py:Class`（文件型 realm
+  按 mtime 缓存，改了重新执行）；只有内置 `subagents` 可以省略 `source`；
+- `realms[].config` 由 realm 自己的 `Config` 模型校验（例如 memory 的 `dir` / `embed` /
+  `vectors` / `extraction`），拼错的键直接报错；
+- 字符串里可以写 `${VAR}`（`load()` 时展开，未定义报错）、`$$` 转义成字面 `$`、`~` 展开；
+- 小程序想复用一份配方：`setup profile init --template other.json` 复制一份再改。
 
 ### CLI 内交互式配置
 
@@ -85,42 +133,51 @@ liorium-cli setup --json show                     # 脚本化：JSON 输出
 liorium[...]> /setup              # 顶层菜单：provider / 记忆 / 查看 / 体检 / 建空配置
 liorium[...]> /setup providers    # 直接进 provider 子菜单
 liorium[...]> /setup memory       # 直接进记忆子菜单
+liorium[...]> /setup profile      # 装配全景 + 改 profile 的入口
 liorium[...]> /setup show         # 当前配置一览
 ```
 
-改完立刻生效：provider 变更会重新读 `providers.json` 并热切换到默认模型；记忆开关走
-`/realm enable|disable memory`；embedding 设置变化会重建记忆 realm。只有**记忆库目录**
-变更需要重启（realm 路径在启动时装配），提示会写明。
+改完立刻生效：provider 变更会重新读 `providers.json` 并热切换到默认模型；记忆设置变化会重读
+profile 并重建记忆 realm；`/reload` 重读 profile + 重扫技能目录 / 记忆库。只有 **id / inbox**
+变更需要重启（身份不参与热更新），提示会写明。`/setup` 写入的就是 `--profile` 选中的那份文件。
 
 ### 新电脑第一次运行
 
 什么配置都没有时，`liorium-cli` 会：
 
-1. 建出 `~/.liorium/`、空的 `providers.json`（`{"providers": []}`）与 `config.json`；
+1. 建出 `~/.liorium/`、空的 `providers.json`（`{"providers": []}`）、UI-only `config.json`
+   与默认 `profile.json`（五件套，`provider_file` 指向刚建的那份 providers）；
 2. 进入「未配置」REPL：`/help` `/setup` `/show` `/doctor` `/init` `/path` `/exit` 可用，
    普通提问只提示先配置；
 3. 非交互场景（`-p`、`--json`、管道）直接以退出码 2 提示 `liorium-cli setup …`，不会卡住等 stdin。
+
+老版本升级上来时，`~/.liorium/config.json` 里属于装配的字段会在**第一次启动**自动搬到
+`profile.json`（原文件备份成 `config.json.bak`，随后重写成 UI-only）；命令行会给一行迁移摘要。
+手动重跑：`liorium-cli setup profile migrate`（profile 已存在时只提示跳过、返回非零）。
 
 ## 常用参数
 
 | 参数 | 说明 |
 |---|---|
-| `--workspace` | 工作区根（裸路径与 `execute` 的 cwd），默认当前目录 |
-| `--inbox` | Agent 根（prompt / checkpoint / 记忆 / 子代理），默认 `<workspace>/.liorium-cli/agent` |
-| `--provider` / `--model` | 指定 provider 与模型（也支持 `Provider::model`） |
-| `--thinking {off,low,medium,high}` | 思考强度（默认 `medium`；`off` 关闭） |
+| `--profile` | Agent profile 路径（默认 `./.liorium/profile.json` → `~/.liorium/profile.json`） |
+| `--workspace` | 工作区根（裸路径与 `execute` 的 cwd），覆盖 profile 的 `workspace` |
+| `--inbox` | Agent 根（prompt / checkpoint / 记忆 / 子代理），覆盖 profile 的 `inbox` |
+| `--provider` / `--model` | 指定 provider 与模型（也支持 `Provider::model`）；只影响本次运行 |
+| `--thinking {off,low,medium,high}` | 思考强度（默认取 profile，通常 `medium`；`off` 关闭） |
 | `--no-thinking` | 等价 `--thinking off` |
 | `--hide-reasoning` | 只隐藏 `reasoning_delta` 显示（不改变是否请求） |
+| `--temperature` / `--max-turns` | 覆盖本次运行的采样温度 / 回合上限（默认取 profile） |
 | `--models-dev {off,cache,refresh}` | 目录策略；默认 `cache`（只读本地缓存，不联网） |
 | `--models-dev-cache` | 目录缓存文件；默认 `~/.liorium/cache/models_dev/api.json` |
 | `--refresh-models` | 启动时从各 Provider `/models` 刷新模型列表（联网） |
-| `--no-core-tools` | 不装配核心工具（`read/write/edit/search/find/execute`），Agent 变零工具 |
-| `--tools read,write,find` | 只装配这些核心工具（写进 `AgentSpec.toolsets["default"]`）；与 `--no-core-tools` 互斥 |
-| `--no-memory` / `--no-skills` / `--no-todo` / `--no-subagents` | 关掉对应能力 |
-| `--memory-dir` / `--skills-dir` | 自定义记忆库 / 技能目录 |
+| `--no-memory` / `--no-skills` / `--no-todo` / `--no-subagents` | 本次运行不装配对应能力（永久关掉就改 profile） |
 | `-p, --prompt` | 单轮模式：跑完退出 |
 | `--json` | 事件以 JSON Lines 输出（配合 `-p` / 管道） |
+| `--system` | 用这个文件当 system prompt（替代 inbox/AGENT.md） |
 | `--list-models` | 列出配置里的模型（格式 / 上下文 / 输出 / 思考形状）后退出 |
+
+核心工具子集 / 记忆目录 / embedding 凭据这类**结构性设置没有 flag**：写进 profile
+（`toolsets.default`、`realms[id=memory].config.*`）。
 
 思考开启时**不发送 `temperature`**（Responses / Anthropic 的 thinking 与 temperature
 不兼容）；`--temperature` 在 `--thinking off` 时生效。`aux` / `compact` 调用永远不思考。
@@ -169,9 +226,10 @@ liorium[...]> /setup show         # 当前配置一览
 ```
 src/liorium/cli/
 ├── app.py        # 参数解析 / .env 装载 / 冷启动 / run_cli
-├── session.py    # CliSession：Agent 装配、REPL、斜杠命令
-├── setup.py      # setup 子命令 + 交互式向导（provider / 记忆）
-├── config.py     # ~/.liorium/config.json：schema / 读写 / 冷启动骨架
+├── session.py    # CliSession：由 ProfileBuild 装配 Agent、REPL、斜杠命令
+├── setup.py      # setup 子命令 + 交互式向导（provider / 记忆 / profile）
+├── profile.py    # ~/.liorium/profile.json：模板 / 路径发现 / 迁移 / realm 读写
+├── config.py     # ~/.liorium/config.json：只剩 UI 偏好 + 冷启动骨架
 ├── subagents.py  # 子代理事件监控与渲染
 ├── providers.py  # 配置搜索 / 向导 / 模型工厂（委托 liorium.provider）
 ├── env.py        # .env 解析与优先级

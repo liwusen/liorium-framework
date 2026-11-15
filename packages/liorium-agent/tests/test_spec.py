@@ -2,11 +2,11 @@
 
 两个核心契约：
 
-1. **指纹只覆盖结构**：``model`` / ``prompt_sources`` / ``realms``（含 params）/
+1. **指纹只覆盖结构**：``model`` / ``prompt_sources`` / ``realms``（含 config）/
    ``toolsets`` / ``limits`` 参与指纹；``id`` / ``inbox_dir`` / ``boot`` 是身份与引导语，
    **不**参与。改结构必须变指纹（否则 reconcile 不会 apply），改身份必须不变
    （否则每次重启都全量重建）。
-2. **spec 只装能被读出来的东西**：``params`` 不可序列化就报错，不许静默放过
+2. **spec 只装能被读出来的东西**：``config`` 不可序列化就报错，不许静默放过
    （``repr`` 里的 ``id`` 会让同一结构产生不同指纹）。
 """
 
@@ -30,7 +30,7 @@ def make_spec(**overrides: object) -> AgentSpec:
         "model": "provider::model-a",
         "prompt_sources": ("AGENT.md", "ROLE.md"),
         "realms": (
-            RealmSpec(id="memory", params={"top_k": 5}),
+            RealmSpec(id="memory", config={"top_k": 5}),
             RealmSpec(id="skills"),
         ),
         "toolsets": {"core": ("read", "write")},
@@ -62,8 +62,8 @@ def test_fingerprint_is_stable_when_only_declaration_style_changes() -> None:
     "overrides",
     [
         {"model": "provider::model-b"},
-        {"realms": (RealmSpec(id="memory", params={"top_k": 9}), RealmSpec(id="skills"))},
-        {"realms": (RealmSpec(id="memory", params={"top_k": 5}),)},
+        {"realms": (RealmSpec(id="memory", config={"top_k": 9}), RealmSpec(id="skills"))},
+        {"realms": (RealmSpec(id="memory", config={"top_k": 5}),)},
         {"toolsets": {"core": ("read",)}},
         {"toolsets": {"core": ("read", "write"), "memory": ("recall",)}},
         {"limits": Limits(max_turns=10)},
@@ -147,20 +147,21 @@ def test_duplicate_realm_id_is_rejected() -> None:
         )
 
 
-def test_unserializable_realm_params_are_rejected() -> None:
-    """``params`` 会进指纹：lambda / 连接对象必须在构造期炸掉。"""
+def test_unserializable_realm_config_is_rejected() -> None:
+    """``config`` 会进指纹：lambda / 连接对象必须在构造期炸掉。"""
     with pytest.raises(SpecError) as excinfo:
-        RealmSpec(id="weather", params={"callback": lambda: None})
+        RealmSpec(id="weather", config={"callback": lambda: None})
     assert "weather" in str(excinfo.value)
-    assert "params" in str(excinfo.value)
+    assert "config" in str(excinfo.value)
 
 
-def test_realm_spec_normalizes_params_and_requires() -> None:
+def test_realm_spec_normalizes_config_and_requires() -> None:
     params: dict[str, object] = {"k": 1}
-    realm = RealmSpec(id="memory", params=params, requires=["core"])
+    realm = RealmSpec(id="memory", config=params, requires=["core"])
     params["k"] = 2  # 外部改动不许影响已建 spec
 
-    assert realm.params == {"k": 1}
+    assert realm.config == {"k": 1}
+    assert realm.params == {"k": 1}  # 旧名只读别名
     assert realm.requires == ("core",)
     assert isinstance(realm.requires, tuple)
 

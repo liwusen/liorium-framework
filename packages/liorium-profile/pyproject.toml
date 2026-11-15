@@ -1,0 +1,45 @@
+[project]
+name = "liorium-profile"
+version = "0.1.1"
+description = "Liorium Agent Profile：JSON/Pydantic 装配配方 → AgentSpec + realm 工厂 + 模型池"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "liwusen" }]
+keywords = ["agent", "llm", "langgraph", "realm", "framework", "profile"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = [
+    "liorium-agent",
+    "liorium-provider-manager",
+    # 严格 schema：profile 会执行本地代码，拼错的键必须炸。
+    "pydantic>=2.7,<3",
+]
+
+[tool.uv.sources]
+liorium-agent = { workspace = true }
+liorium-provider-manager = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# 命名空间包：src/liorium 下没有 __init__.py，必须用 only-include + sources
+# 让 wheel 里是 liorium/profile/... 而不是 profile/...
+only-include = ["src/liorium"]
+sources = ["src"]
+
+[project.urls]
+Homepage = "https://github.com/liwusen/liorium-framework"
+Repository = "https://github.com/liwusen/liorium-framework"
+Documentation = "https://github.com/liwusen/liorium-framework/tree/main/docs"
+Changelog = "https://github.com/liwusen/liorium-framework/releases"
+Issues = "https://github.com/liwusen/liorium-framework/issues"

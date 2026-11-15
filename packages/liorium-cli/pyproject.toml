@@ -20,6 +20,8 @@ classifiers = [
 dependencies = [
     "liorium-agent[core,memory-vector,skills,todo]",
     "liorium-provider-manager[all]",
+    # 装配配方：CLI 从 profile 编译出 spec / realm 工厂 / 模型池（2026-11-14）。
+    "liorium-profile",
 ]
 
 [project.scripts]
@@ -34,6 +36,7 @@ liorium-memory = { workspace = true }
 liorium-skills = { workspace = true }
 liorium-todo-realm = { workspace = true }
 liorium-provider-manager = { workspace = true }
+liorium-profile = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

@@ -130,7 +130,7 @@ query ──┬─ 关键词路：FTS5 BM25（index/fts.sqlite，中文二元组
 | D5 | 融合从"归一化加权平均"改为 **RRF** | 见 §4：两路量纲不同，归一化会抹平位次 |
 | D6 | `advanced_search` **只返回文件** | 既有实现把目录节点也塞进结果，检索语义上没有意义；目录用 `children`/`memory_list` |
 | D7 | `memory_search` 的 `tags` 是 **AND 过滤**（与 `advanced_search` 一致） | 旧的 `_hybrid_search` 也是 `required_tags ⊆ tags`；`store.search()` 保留旧的"有交集即命中"语义并在 docstring 里写明 |
-| D8 | 向量**格式不变**，落盘策略变：惰性加载 + 延迟落盘 + `unload()` + `params["vectors"]=False` | 全量矩阵常驻是 nano 的固有代价；把"何时加载/何时写盘"变成可控。`vectors=False` ≈ 旧 `BM25_ONLY` |
+| D8 | 向量**格式不变**，落盘策略变：惰性加载 + 延迟落盘 + `unload()` + `config["vectors"]=False` | 全量矩阵常驻是 nano 的固有代价；把"何时加载/何时写盘"变成可控。`vectors=False` ≈ 旧 `BM25_ONLY` |
 | D9 | 实体不进分块索引，实体名靠 `memory_graph(action="search")` | 实体节点 `path IS NULL`（与旧库一致），没有路径就无法作为检索结果返回；既有实现把实体塞进 BM25 后又在 `_hybrid_search` 里过滤掉，实际也是走图谱 |
 | D10 | 实体类型**不做白名单收敛** | 旧库里有 `chat_record` / `diary` 这类自定义类型，收敛会把记录链断掉 |
 | D11 | 记录→实体用 `from` 边（既有实现用 `has_child`） | 本项目不变量：`has_child` 只表示 path↔path；`next` 链保留 |
@@ -156,31 +156,26 @@ query ──┬─ 关键词路：FTS5 BM25（index/fts.sqlite，中文二元组
 LangChain 的 `var_child_runnable_config`，那次 LLM 调用会成为主 run 的子 run，
 `on_chat_model_stream` 会冒泡进主 Agent 的 astream_events，被当成主回复的 delta 发给前端。
 
-## 8. `RealmSpec.params`
+## 8. `RealmSpec.config`（`MemoryRealm.Config = MemoryConfig`）
 
 | 键 | 默认 | 语义 |
 |---|---|---|
-| `db_path` | `<inbox>/memory/memory.sqlite` | 主库路径（相对路径相对 `inbox_dir`） |
-| `content_dir` | `<inbox>/memory/content` | 正文目录 |
+| `dir` | `<inbox>/memory` | 记忆目录（相对 `inbox_dir`）；`db_path` / `content_dir` 由它派生 |
+| `db_path` | `<inbox>/memory/memory.sqlite` | 主库路径的旧入口（不能与 `dir` 同时给） |
+| `content_dir` | `<inbox>/memory/content` | 正文目录的旧入口（不能与 `dir` 同时给） |
 | `list_limit` | `200` | 一层最多投影多少子节点（超出用 `memory_list` 分页） |
 | `keyword_index` | `True` | 是否建 `index/fts.sqlite`（关掉则检索退回 LIKE 打分） |
-| `vectors` | `True` | 是否启用向量检索/索引器（还要宿主注入 `embedder`+`vectors`，否则自动关闭） |
-| `extraction` | `True` | 是否在写记忆后自动抽实体（还要注入 `extractor`） |
+| `vectors` | `True` | 是否启用向量检索/索引器（还要有 `embed` 且装了 `[vector]`，否则自动关闭） |
+| `extraction` | `True` | 是否在写记忆后自动抽实体（还要有 `ctx.model`，否则自动关闭） |
+| `embed` | `null` | `{model, base_url, api_key}`；给了才建 embedding / 向量后端 |
 
-服务（embedding / 向量后端 / 抽取器）**不走 params**：params 要能进指纹，而服务对象不可序列化。
-用 realm 工厂闭包注入：
+`Config` 是 pydantic 模型（`extra="forbid"`）：profile `load()` 时就校验并补默认值，
+拼错的键会直接报错。**凭据必须显式**（`api_key` 必填）——realm 看不到 `ProviderRegistry`，
+不会替你从 chat provider 借 key；想复用就用 `${OPENAI_API_KEY}` 这种环境变量写法。
 
-```python
-def memory_realm(spec):
-    return MemoryRealm(
-        spec,
-        embedder=OpenAICompatibleEmbeddings(model="text-embedding-3-small",
-                                            api_key=..., base_url=...),
-        vectors=NanoVectorBackend(inbox / "memory/index/chunks.vdb"),
-        entity_vectors=NanoVectorBackend(inbox / "memory/index/entity.vdb"),
-        extractor=LlmExtractor(chat=my_chat),
-    )
-```
+服务（embedding / 向量后端 / 抽取器）**不再由宿主注入**（2026-11-14）：`start()` 里按
+`config.embed` 自组装，`stop()` 时关掉自己造的那些；`extraction` 用 `ctx.model`
+（aux 模型，拿不到就自动关闭）。宿主仍可显式注入同名参数覆盖（注入的优先，且不由 realm 关闭）。
 
 ## 8.1 配置速查
 
@@ -189,9 +184,9 @@ def memory_realm(spec):
 
 要语义检索/实体抽取，两种装法：
 
-### A0. `~/.liorium/config.json` / `.env` 文件
+### A0. `~/.liorium/profile.json` / `.env` 文件
 
-记忆相关的开关可以持久化，避免每次带一长串参数：
+记忆相关的开关可以持久化，避免每次带一长串参数（改动写进 profile 的 memory 条目）：
 
 ```powershell
 liorium-cli setup memory set dir D:/data/liorium-memory
@@ -199,58 +194,79 @@ liorium-cli setup memory set embed-model text-embedding-3-small
 liorium-cli setup memory show
 ```
 
-也可以用 `.env`（临时覆盖；优先级：命令行 > 环境变量 > `.env` > `config.json` > 内置默认）：
+也可以用 `.env`（临时覆盖；优先级：命令行 > 环境变量 > `.env` > `profile.json` / `config.json` > 内置默认）：
 
 ```powershell
 Copy-Item .env.example .env    # 模板（已入库，无密钥）
-notepad .env                   # 填 provider / 模型 / 记忆目录 / embedding
+notepad .env                   # 填 provider / 模型 / embedding 凭据
 uv run python -m liorium.cli
 ```
 
 - **查找顺序**：`$env:LIORIUM_ENV_FILE` → `./.env` → `./.env.local`；
-- **优先级**：命令行 > 进程环境变量 > `.env` > `~/.liorium/config.json` > 内置默认（`.env` 永远不覆盖已存在的环境变量）；
+- **优先级**：命令行 > 进程环境变量 > `.env` > `~/.liorium/profile.json` / `config.json` > 内置默认（`.env` 永远不覆盖已存在的环境变量）；
 - `--env-file <path>` 指定文件，`--no-env` 完全不读；`$env:LIORIUM_ENV_FILE=""` 也能关掉自动加载；
-- 键名 = `LIORIUM_` + 选项名大写（`--no-color` → `LIORIUM_NO_COLOR=1`，`--memory-dir` → `LIORIUM_MEMORY_DIR=...`）；
+- 键名 = `LIORIUM_` + 选项名大写（`--no-color` → `LIORIUM_NO_COLOR=1`）；
 - 支持 `# 注释`、`export KEY=...`、单/双引号、`${VAR}` 引用前面定义的键；
 - 没有 provider 配置文件时，`.env` 里的 `LIORIUM_BASE_URL` + `LIORIUM_CHAT_KEY` + `LIORIUM_MODEL`
   可以独立拼出一个 OpenAI 兼容 provider（键名见 `.env.example`）。
 
 ### A. CLI（`liorium-cli` / `liorium.cli`）
 
-| 开关 / 环境变量 | 作用 |
+2026-11-14 起记忆的**结构与凭据**不再走命令行 flag，而是写在 `profile.json` 的
+`realms[memory].config` 里（`MemoryRealm.Config = MemoryConfig`）；flag 只保留"本次运行装不装"
+的 `--no-memory`。这样语义只有一份真相，`--help` 也不会再列出十几个记忆开关。
+
+| profile 里的键（`realms[id=memory].config.*`） | 作用 |
 |---|---|
-| `--embed-model` / `LIORIUM_EMBED_MODEL` | **总开关**：给了才建向量索引、才自动抽实体（例：`text-embedding-3-small`、`text-embedding-v4`） |
-| `--embed-base-url` / `LIORIUM_EMBED_BASE_URL` | embedding 的 OpenAI 兼容 base_url；空 = 跟随当前 chat provider |
-| `--embed-key` / `LIORIUM_EMBED_KEY` | embedding 的 key；空 = 跟随当前 chat provider 的 key |
-| `--no-vectors` | 不建向量索引（只跑关键词），同时不抽实体 |
-| `--no-extraction` | 只向量化、不抽实体（省每写一次记忆一次模型调用） |
-| `--memory-dir` | 记忆库目录，默认 `<inbox>/memory`；指到已有的 `agents/<name>/memory` 就是直接接管旧库 |
+| `embed.model` / `embed.base_url` / `embed.api_key` | **总开关**：给了才建向量索引、才自动抽实体。凭据必须显式写（不再跟随 chat provider） |
+| `vectors`（默认 `true`） | 不建向量索引（只跑关键词），同时不抽实体 |
+| `extraction`（默认 `true`） | 只向量化、不抽实体（省每写一次记忆一次模型调用） |
+| `dir` | 记忆库目录（相对 `<inbox>`），默认 `<inbox>/memory`；指到已有的 `agents/<name>/memory` 就是直接接管旧库 |
+| `db_path` / `content_dir` | 旧宿主的兼容入口（与 `dir` 二选一） |
+| `list_limit` / `keyword_index` | 列表上限（默认 200）/ 关键词索引开关 |
 
-```powershell
-# 只开语义检索（复用 chat provider 的 key 与 base_url）
-uv run python -m liorium.cli --embed-model text-embedding-3-small
-
-# 换个 embedding 端点（比如本地/代理）
-uv run python -m liorium.cli `
-    --embed-model bge-m3 --embed-base-url http://127.0.0.1:8080/v1 --embed-key local
-
-# 接管旧库 + 关掉抽取
-uv run python -m liorium.cli `
-    --memory-dir "D:\path\to\agent\memory" --no-extraction
+```json
+{
+  "version": 1,
+  "realms": [
+    {
+      "id": "memory",
+      "source": "liorium.memory:MemoryRealm",
+      "config": {
+        "dir": "D:/data/liorium-memory",
+        "embed": {
+          "model": "text-embedding-3-small",
+          "base_url": "https://api.openai.com/v1",
+          "api_key": "${OPENAI_API_KEY}"
+        },
+        "extraction": false
+      }
+    }
+  ]
+}
 ```
 
-chat 模型本身仍走原有 provider 配置：`LIORIUM_PROVIDER_CONFIG` → `<LIORIUM_HOME>/providers.json`
-（默认 `~/.liorium/providers.json`）→ `./providers.json`（`--config` 可显式指定）。embedding 默认复用
-**当前 chat provider** 的 `base_url` 与 `key`，所以大多数 OpenAI 兼容端点不用额外配。
+`${OPENAI_API_KEY}` 在 `load()` 时展开；`~` 也会展开。写 `"embed": null`（或删掉）就是
+"只跑关键词检索"。**迁移注意**：旧 `config.json` 里的 `memory.embed_*` 会被一次性搬到 profile，
+空的 `embed_base_url` / `embed_key` 用当时解析出的 provider 值补全（等价旧行为）；之后要改就得
+改 profile。
 
-上面这些开关也可以持久化，不用每次敲参数（写进 `~/.liorium/config.json`，命令行与环境变量仍然优先）：
+同样的改动也可以不手写 JSON：
 
 ```powershell
 liorium-cli setup memory set dir D:/data/liorium-memory
 liorium-cli setup memory set embed-model text-embedding-3-small
+liorium-cli setup memory set embed-key sk-...
 liorium-cli setup memory set vectors off       # 只跑关键词检索
+liorium-cli setup memory set extraction off    # 不抽实体
 liorium-cli setup memory show                  # 看当前记忆配置与库位置
+liorium-cli setup memory disable               # 从 profile 里删掉 memory 条目
 ```
+
+chat 模型仍走原有 provider 配置：`LIORIUM_PROVIDER_CONFIG` → `<LIORIUM_HOME>/providers.json`
+（默认 `~/.liorium/providers.json`）→ `./providers.json`（`--config` 可显式指定）。
+embedding **不再默认复用** chat provider 的 `base_url` / `key`：realm 看不到 registry，
+profile 里写什么就是什么（`${VAR}` 让你不必把密钥写进文件）。
 
 ### B. 库内（自己装配 realm）
 
@@ -286,9 +302,9 @@ realm_factory = lambda spec: MemoryRealm(
 |---|---|
 | 启动日志说「语义检索不可用」 | 没装 extra：`pip install 'liorium[vector]'`（numpy + nano-vectordb + httpx） |
 | `embedding 维度不对: 期望 1536` | 服务端不支持 `dimensions` 参数。`.vdb` 格式要求 1536，换维度 = 断兼容（要么换服务，要么改 `EMBED_DIM` 并清空 `index/`） |
-| `向量索引维度不兼容: 文件是 1536，本后端是 …` | 换了 embedding 模型。删掉 `index/chunks.vdb`（或换 `--memory-dir`）重来 |
+| `向量索引维度不兼容: 文件是 1536，本后端是 …` | 换了 embedding 模型。删掉 `index/chunks.vdb`（或换 profile 里的 `config.dir`）重来 |
 | 写完记忆立刻 `memory_search` 搜不到语义结果 | 向量是**最终一致**的（后台队列，几百毫秒~几秒）；关键词结果立刻就有。要立刻齐可用 `realm.drain_index()` |
-| 每一笔写入都多一次模型调用 | 那是抽取。`--no-extraction` 或 `params={"extraction": False}` |
+| 每一笔写入都多一次模型调用 | 那是抽取。profile 里写 `config: {"extraction": false}`（或 `setup memory set extraction off`） |
 | 关键词搜得到、语义一直搜不到 | `store.keyword_index_status()` 看 `pending_vectors`；`realm.drain_index()` 手动推完，失败原因看 ERROR 日志 |
 
 ## 9. 内存与性能预算（估算）

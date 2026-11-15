@@ -1,16 +1,13 @@
-"""CLI 用户设置：``~/.liorium/config.json`` 与冷启动骨架。
+"""CLI 用户设置：``~/.liorium/config.json``（只剩 UI 偏好）与冷启动骨架。
 
-为什么和 ``providers.json`` 分开：
+2026-11-14 起（计划 G1 / A5）：**装配**看 ``profile.json``（Agent Profile），
+``config.json`` 只放"怎么显示"——颜色、是否隐藏 reasoning。这样 Agent 语义只有一份真相，
+UI 偏好也不会污染库的 schema。
 
-- ``providers.json`` 只放 provider 与密钥（0600、由 ``liorium-provider-manager`` 校验，
-  团队之间可以直接分享一份去掉 key 的版本）；
-- ``config.json`` 放"怎么跑"：默认模型 / 思考强度 / 工作区 / 记忆 / 技能 / 待办 / UI。
+为什么 provider 仍单独一个文件：``providers.json`` 只放 provider 与密钥（0600、
+由 ``liorium-provider-manager`` 校验，团队之间可以直接分享一份去掉 key 的版本）。
 
-两个文件都**可以不存在**：读不到就用内置默认，启动不会因此失败。第一次运行时
-:func:`ensure_home` 会把目录和两个空骨架建出来，所以新电脑上 ``liorium-cli`` 能直接起来，
-再由用户决定什么时候填 provider。
-
-优先级（高 → 低）：命令行参数 > 进程环境变量 > ``.env`` > ``config.json`` > 内置默认。
+三个文件都**可以不存在**：读不到就用内置默认，启动不会因此失败。
 """
 
 from __future__ import annotations
@@ -39,49 +36,33 @@ CONFIG_VERSION = 1
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": CONFIG_VERSION,
-    # 默认模型（Provider::model）；None = 用 providers.json 的 main_model。
-    "model": None,
-    "thinking": "medium",
-    "workspace": None,
-    "inbox": None,
-    "memory": {
-        "enabled": True,
-        "dir": None,
-        "embed_model": "",
-        "embed_base_url": "",
-        "embed_key": "",
-        "vectors": True,
-        "extraction": True,
-    },
-    "skills": {"enabled": True, "dir": None},
-    "todo": {"enabled": True},
-    "subagents": {"enabled": True},
     "ui": {"color": True, "hide_reasoning": False},
 }
 
-#: 可写入的键 → (类型, 说明)。类型决定 :func:`coerce` 怎么解析用户输入。
+#: 可写入的键 → (类型, 说明)。只剩 UI；Agent 装配键已经迁到 profile（见 migrate_to_profile）。
 KEYS: dict[str, tuple[str, str]] = {
-    "model": ("str", "默认模型（Provider::model）"),
-    "thinking": ("choice", f"思考强度（{'/'.join(THINKING_LEVELS)}）"),
-    "workspace": ("path", "工作区根目录（默认当前目录）"),
-    "inbox": ("path", "Agent 根目录：prompt / checkpoint（默认 <workspace>/.liorium-cli/agent）"),
-    "memory.enabled": ("bool", "是否启用长期记忆"),
-    "memory.dir": ("path", "记忆库目录（默认 <inbox>/memory）"),
-    "memory.embed_model": ("str", "embedding 模型（给了才启用语义检索）"),
-    "memory.embed_base_url": ("str", "embedding 的 OpenAI 兼容 base_url（默认跟随 provider）"),
-    "memory.embed_key": ("str", "embedding 的 API key（默认跟随 provider）"),
-    "memory.vectors": ("bool", "是否建向量索引（关掉只跑关键词）"),
-    "memory.extraction": ("bool", "写记忆后是否自动抽实体 / 关系"),
-    "skills.enabled": ("bool", "是否启用技能库"),
-    "skills.dir": ("path", "技能目录（默认 <inbox>/skill.d）"),
-    "todo.enabled": ("bool", "是否启用待办"),
-    "subagents.enabled": ("bool", "是否启用子代理"),
     "ui.color": ("bool", "是否用 ANSI 颜色"),
     "ui.hide_reasoning": ("bool", "是否隐藏 reasoning 增量"),
 }
 
+#: 旧 ``config.json`` 里属于装配的键：命中这些键时给出"去改 profile"的明确指引。
+LEGACY_KEYS: dict[str, str] = {
+    "model": "profile 的 model",
+    "thinking": "profile 的 thinking",
+    "temperature": "profile 的 temperature",
+    "workspace": "profile 的 workspace",
+    "inbox": "profile 的 inbox",
+    "prompt": "profile 的 prompt",
+    "toolsets": "profile 的 toolsets",
+    "limits": "profile 的 limits",
+    "memory": "profile 里 memory realm 的 config",
+    "skills": "profile 里 skills realm 的 config",
+    "todo": "profile 的 realms",
+    "subagents": "profile 的 realms",
+}
+
 #: 需要打码显示的值（``setup show`` / ``/setup show``）。
-SECRET_KEYS = frozenset({"memory.embed_key"})
+SECRET_KEYS: frozenset[str] = frozenset()
 
 _TRUE = {"1", "true", "yes", "on", "y", "t"}
 _FALSE = {"0", "false", "no", "off", "n", "f", ""}
@@ -235,13 +216,28 @@ def ensure_home(
 
 
 # ---------------------------------------------------------------------------
+# 迁移（旧 config.json → profile.json）
+# ---------------------------------------------------------------------------
+
+
+def migrate_to_profile(**kwargs: Any) -> Path | None:
+    """把旧 ``config.json`` 的装配字段迁到 profile（一次性；实现在 ``cli.profile``）。
+
+    返回 profile 路径；不需要迁移（profile 已存在 / 旧配置没有装配字段）时返回 ``None``。
+    """
+    from . import profile as profile_module
+
+    return profile_module.migrate_to_profile(**kwargs)
+
+
+# ---------------------------------------------------------------------------
 # 取值 / 赋值
 # ---------------------------------------------------------------------------
 
 
 def get_value(config: Mapping[str, Any], key: str, default: Any = None) -> Any:
-    """读一个点分键（``memory.dir``）；不存在返回 ``default``。"""
-    node: Any = config
+    """读一个点分键（``ui.color``）；不存在返回 ``default``。"""
+    node = config
     for part in str(key).split("."):
         if not isinstance(node, Mapping) or part not in node:
             return default
@@ -256,6 +252,7 @@ def set_value(config: dict[str, Any], key: str, raw: Any) -> Any:
     用户会以为配置生效了。
     """
     name = str(key).strip()
+    _reject_legacy(name)
     if name not in KEYS:
         known = ", ".join(sorted(KEYS))
         raise ConfigError(f"未知配置键: {name!r}（可用: {known}）")
@@ -275,11 +272,21 @@ def set_value(config: dict[str, Any], key: str, raw: Any) -> Any:
 def unset_value(config: dict[str, Any], key: str) -> Any:
     """恢复内置默认值（就地修改），返回值。"""
     name = str(key).strip()
+    _reject_legacy(name)
     if name not in KEYS:
         known = ", ".join(sorted(KEYS))
         raise ConfigError(f"未知配置键: {name!r}（可用: {known}）")
     fallback = get_value(default_config(), name)
     return set_value(config, name, fallback)
+
+
+def _reject_legacy(name: str) -> None:
+    top = name.split(".", 1)[0]
+    if top in LEGACY_KEYS:
+        raise ConfigError(
+            f"{name!r} 是 Agent 装配设置，已经迁到 profile（{LEGACY_KEYS[top]}）；"
+            "请用 `liorium-cli setup profile edit` 或直接改 profile.json"
+        )
 
 
 def coerce(key: str, raw: Any) -> Any:
@@ -290,9 +297,7 @@ def coerce(key: str, raw: Any) -> Any:
     if kind == "choice":
         text = str(raw or "").strip().lower()
         if text not in THINKING_LEVELS:
-            raise ConfigError(
-                f"{key} 只能是 {'/'.join(THINKING_LEVELS)}，收到 {raw!r}"
-            )
+            raise ConfigError(f"{key} 只能是 {'/'.join(THINKING_LEVELS)}，收到 {raw!r}")
         return text
     if kind == "path":
         text = str(raw or "").strip()
@@ -352,6 +357,7 @@ __all__ = [
     "DEFAULT_CONFIG",
     "HOME_ENV",
     "KEYS",
+    "LEGACY_KEYS",
     "PROVIDERS_ENV",
     "SECRET_KEYS",
     "THINKING_LEVELS",
@@ -366,6 +372,7 @@ __all__ = [
     "home_dir",
     "load_config",
     "mask_secret",
+    "migrate_to_profile",
     "providers_path",
     "save_config",
     "set_value",

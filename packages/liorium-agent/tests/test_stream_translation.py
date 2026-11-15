@@ -22,6 +22,7 @@ from liorium.agent.runtime.stream import (
     is_ai_message_chunk,
     message_content_to_text,
     normalize_tool_args,
+    tool_error_to_text,
     tool_value_to_text,
 )
 
@@ -307,6 +308,59 @@ def test_finished_tool_call_is_not_drained() -> None:
     translator.translate(_event("on_tool_start", tool_name="read"))
     translator.translate(_event("on_tool_end", tool_name="read", data={"output": "ok"}))
     assert translator.drain_unfinished() == []
+
+
+# ---------------------------------------------------------------------------
+# 工具异常（2026-11-12）
+# ---------------------------------------------------------------------------
+
+
+def test_tool_error_emits_paired_tool_result() -> None:
+    """``on_tool_error`` 必须补一条 tool_result，而不是留到收尾补 ``[已中断]``。"""
+    translator = EventTranslator()
+    started = translator.translate(
+        _event("on_tool_start", tool_name="read", data={"input": {"path": "notes.txt"}})
+    )
+    failed = translator.translate(
+        _event("on_tool_error", tool_name="read", data={"error": ValueError("uri: Field required")})
+    )
+
+    assert [event.type for event in failed] == ["tool_result"]
+    assert failed[0].get("call_id") == started[0].get("call_id")
+    assert failed[0].get("tool_name") == "read"
+    assert failed[0].get("output") == "[工具执行出错] ValueError: uri: Field required"
+
+    # 已配对：收尾不再补 [已中断]，也不重复发
+    assert translator.drain_unfinished() == []
+
+
+def test_tool_error_without_name_uses_start_name() -> None:
+    """error 事件没带 ``name`` 时用 start 记下的工具名，并清掉配对队列。"""
+    translator = EventTranslator()
+    translator.translate(_event("on_tool_start", tool_name="execute"))
+    failed = translator.translate(_event("on_tool_error", data={"error": "boom"}))
+
+    assert failed[0].get("tool_name") == "execute"
+    assert failed[0].get("output") == "[工具执行出错] boom"
+    assert translator.drain_unfinished() == []
+
+
+def test_tool_error_after_end_is_ignored() -> None:
+    """``handle_tool_error`` 之类路径可能先 end 再 error：只认第一条。"""
+    translator = EventTranslator()
+    translator.translate(_event("on_tool_start", tool_name="read"))
+    translator.translate(_event("on_tool_end", data={"output": "ok"}))
+
+    assert translator.translate(_event("on_tool_error", data={"error": "late"})) == []
+    assert translator.drain_unfinished() == []
+
+
+def test_tool_error_to_text_shapes() -> None:
+    """异常 → ``类名: 消息``；字符串 / dict / None 各自兜底。"""
+    assert tool_error_to_text(ValueError("坏")) == "[工具执行出错] ValueError: 坏"
+    assert tool_error_to_text("纯文本") == "[工具执行出错] 纯文本"
+    assert tool_error_to_text(None) == "[工具执行出错]"
+    assert tool_error_to_text({"code": 1}) == '[工具执行出错] {"code": 1}'
 
 
 def test_drain_is_cleared_by_reset() -> None:

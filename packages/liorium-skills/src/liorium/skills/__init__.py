@@ -20,7 +20,7 @@ agent = LioriumAgent(
 ```
 
 默认技能目录是 ``<inbox_dir>/skill.d``（与既有实现的目录布局一致），
-也可以在 ``RealmSpec.params["skills_dir"]`` 里指到别处。
+也可以在 ``RealmSpec.config["skills_dir"]`` 里指到别处。
 """
 
 from __future__ import annotations

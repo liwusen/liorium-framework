@@ -80,14 +80,14 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 # wheel 的「自有」内容只有这一个：liorium/__init__.py（版本号与包文档）。
-# 12 个模块由下面的 force-include 注入（每个包自己的 src/liorium/<子包> → liorium/<子包>），
+# 13 个模块由下面的 force-include 注入（每个包自己的 src/liorium/<子包> → liorium/<子包>），
 # 所以 wheel 内是 liorium/{core,vfs,agent,...}，import 路径与开发时完全一致。
 #
 # force-include 只挂在 wheel 上：sdist 保留 packages/* 的原始目录结构，
 # 这样「sdist → wheel」二次构建时这些路径依然存在（否则会报 Forced include not found）。
 only-include = ["src/liorium"]
 sources = ["src"]
-force-include = { "packages/liorium-core/src/liorium/core" = "liorium/core", "packages/liorium-vfs/src/liorium/vfs" = "liorium/vfs", "packages/liorium-realm-base/src/liorium/realm_base" = "liorium/realm_base", "packages/liorium-core-tool/src/liorium/core_tool" = "liorium/core_tool", "packages/liorium-core-tool-realm/src/liorium/core_tool_realm" = "liorium/core_tool_realm", "packages/liorium-memory/src/liorium/memory" = "liorium/memory", "packages/liorium-skills/src/liorium/skills" = "liorium/skills", "packages/liorium-mcp/src/liorium/mcp" = "liorium/mcp", "packages/liorium-todo-realm/src/liorium/todo_realm" = "liorium/todo_realm", "packages/liorium-provider-manager/src/liorium/provider" = "liorium/provider", "packages/liorium-agent/src/liorium/agent" = "liorium/agent", "packages/liorium-cli/src/liorium/cli" = "liorium/cli" }
+force-include = { "packages/liorium-core/src/liorium/core" = "liorium/core", "packages/liorium-vfs/src/liorium/vfs" = "liorium/vfs", "packages/liorium-realm-base/src/liorium/realm_base" = "liorium/realm_base", "packages/liorium-core-tool/src/liorium/core_tool" = "liorium/core_tool", "packages/liorium-core-tool-realm/src/liorium/core_tool_realm" = "liorium/core_tool_realm", "packages/liorium-memory/src/liorium/memory" = "liorium/memory", "packages/liorium-skills/src/liorium/skills" = "liorium/skills", "packages/liorium-mcp/src/liorium/mcp" = "liorium/mcp", "packages/liorium-todo-realm/src/liorium/todo_realm" = "liorium/todo_realm", "packages/liorium-provider-manager/src/liorium/provider" = "liorium/provider", "packages/liorium-agent/src/liorium/agent" = "liorium/agent", "packages/liorium-cli/src/liorium/cli" = "liorium/cli", "packages/liorium-profile/src/liorium/profile" = "liorium/profile" }
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -99,7 +99,7 @@ include = [
 ]
 
 # ---------------------------------------------------------------------------
-# 工作区：12 个包仍然是 workspace 成员，只为开发期各自 editable 安装 / 各自依赖解析。
+# 工作区：13 个包仍然是 workspace 成员，只为开发期各自 editable 安装 / 各自依赖解析。
 # 根项目本身不在开发环境里安装（package = false），避免与成员包的 liorium.* 重复。
 # ---------------------------------------------------------------------------
 [tool.uv]
@@ -112,7 +112,7 @@ members = ["packages/*"]
 dev = [
     "pytest>=8.3",
     "pytest-asyncio>=1.0",
-    # 把 12 个成员包放进 dev 组：`uv sync --all-packages` 才会真的装进 .venv，
+    # 把 13 个成员包放进 dev 组：`uv sync --all-packages` 才会真的装进 .venv，
     # 与从 PyPI 安装走同一条解析路径（而不是只靠 conftest 注入 sys.path）。
     "liorium-core",
     "liorium-vfs",
@@ -128,6 +128,7 @@ dev = [
     "liorium-agent[all]",
     "liorium-provider-manager[all]",
     "liorium-cli",
+    "liorium-profile",
 ]
 
 [tool.uv.sources]
@@ -143,6 +144,7 @@ liorium-todo-realm = { workspace = true }
 liorium-agent = { workspace = true }
 liorium-provider-manager = { workspace = true }
 liorium-cli = { workspace = true }
+liorium-profile = { workspace = true }
 
 [tool.pytest.ini_options]
 testpaths = ["packages", "tests"]

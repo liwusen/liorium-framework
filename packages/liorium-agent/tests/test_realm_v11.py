@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from liorium.agent import AgentSpec, BaseRealm, Limits, RealmSpec, LioriumAgent
-from liorium_testkit import make_scripted_factory
+from liorium_testkit import collect_turn, make_scripted_factory
 
 
 class DirtyRealm(BaseRealm):
@@ -106,7 +106,7 @@ async def test_dirty_realm_refresh_replaces_tools(agent_workspace: Path) -> None
         assert [tool.name for tool in agent.tools if tool.name in {"alpha", "beta"}] == ["alpha"]
 
         realm.mark_dirty()
-        events = [event async for event in agent.run("一")]
+        events = await collect_turn(agent, "一")
         assert events[-1].type == "done"
         assert [tool.name for tool in agent.tools if tool.name in {"alpha", "beta"}] == [
             "alpha",
@@ -129,7 +129,7 @@ async def test_dirty_refresh_keeps_epoch_when_schema_unchanged(agent_workspace: 
     await agent.start()
     try:
         epoch = agent.epoch.value
-        [event async for event in agent.run("一")]
+        await collect_turn(agent, "一")
         assert agent.epoch.value == epoch
     finally:
         await agent.close()
@@ -268,7 +268,7 @@ async def test_mcp_like_refresh_hook_is_awaited(agent_workspace: Path) -> None:
     await agent.start()
     try:
         realm.mark_dirty()
-        [event async for event in agent.run("一")]
+        await collect_turn(agent, "一")
         assert calls == ["refresh"]
         assert "beta" in [tool.name for tool in agent.tools]
     finally:

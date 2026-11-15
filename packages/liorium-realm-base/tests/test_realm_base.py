@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 from typing import Any
 
 import pytest
@@ -11,6 +12,7 @@ from liorium.realm_base import (
     BaseRealm,
     JsonStateStore,
     RealmContext,
+    RealmMessage,
     TurnInfo,
     build_realm_tools,
     realm_tool,
@@ -59,9 +61,9 @@ def test_base_realm_is_constructible_with_spec() -> None:
         params = {"k": 1}
 
     realm = BaseRealm(Spec())
-    assert realm.params == {"k": 1}
+    assert realm.config == {"k": 1}
     assert realm.ctx is None
-    assert BaseRealm().params == {}
+    assert BaseRealm().config == {}
 
 
 def test_defaults_are_inert() -> None:
@@ -250,4 +252,54 @@ async def test_inject_queues_item_with_default_source(tmp_path) -> None:
     assert len(sink.batches) == 1
     with pytest.raises(RealmError, match="非空文本"):
         realm.ctx.inject("   ")
+
+
+# ---------------------------------------------------------------------------
+# 宿主消息（2026-11-14）：RealmMessage / on_message
+# ---------------------------------------------------------------------------
+
+
+def test_realm_message_freezes_and_copies_data() -> None:
+    payload = {"text": "写 demo"}
+    message = RealmMessage(realm_id="todo", name="  todo.add  ", data=payload, origin="webui")
+
+    assert message.realm_id == "todo"
+    assert message.name == "todo.add"  # 去首尾空白
+    assert message.origin == "webui"
+    # data 是副本：改原 dict 不影响消息
+    payload["text"] = "被改了"
+    assert message.data == {"text": "写 demo"}
+    # 字段冻结
+    with pytest.raises(FrozenInstanceError):
+        message.name = "other"  # type: ignore[misc]
+    # 默认值
+    spare = RealmMessage(realm_id="todo", name="todo.list")
+    assert spare.data == {} and spare.origin == "host"
+
+
+def test_realm_message_rejects_empty_name() -> None:
+    with pytest.raises(RealmError, match="非空 name"):
+        RealmMessage(realm_id="todo", name="   ")
+
+
+async def test_base_realm_on_message_rejects_by_default(tmp_path) -> None:
+    realm = CounterRealm()
+    await realm.start(make_ctx(tmp_path))
+    with pytest.raises(RealmError, match="不接受消息"):
+        await realm.on_message(RealmMessage(realm_id="counter", name="counter.add"))
+
+
+async def test_realm_can_implement_on_message(tmp_path) -> None:
+    class EchoRealm(BaseRealm):
+        id = "echo"
+
+        async def on_message(self, message: RealmMessage) -> str:
+            return f"{message.name}:{message.data.get('x')}"
+
+    realm = EchoRealm()
+    await realm.start(make_ctx(tmp_path, "echo"))
+    reply = await realm.on_message(
+        RealmMessage(realm_id="echo", name="echo.ping", data={"x": 1})
+    )
+    assert reply == "echo.ping:1"
 

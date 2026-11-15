@@ -1,14 +1,14 @@
 # 发布到 PyPI（Trusted Publishing）
 
-Liorium 只发布**一个**发行版：`liorium`。12 个模块（`core` / `vfs` / `realm_base` /
+Liorium 只发布**一个**发行版：`liorium`。13 个模块（`core` / `vfs` / `realm_base` /
 `core_tool` / `core_tool_realm` / `agent` / `memory` / `skills` / `mcp` / `todo_realm` /
-`provider` / `cli`）的源码由根 `pyproject.toml` 的 `force-include` 打进**同一个 wheel**，
+`provider` / `profile` / `cli`）的源码由根 `pyproject.toml` 的 `force-include` 打进**同一个 wheel**，
 所以 Trusted Publishing **只需要填一次表单**。
 
 工作流：[`.github/workflows/publish.yml`](../.github/workflows/publish.yml)
 
 ```
-tag v0.1.1 ──▶ build（1 个 sdist + 1 个 wheel，内含 12 个模块
+tag v0.1.1 ──▶ build（1 个 sdist + 1 个 wheel，内含 13 个模块
                     + twine check + check_wheel 验模块齐全）
             └▶ publish（OIDC 换一次性上传凭证，1 条 publisher）
                └▶ release（把 sdist/wheel 挂到 GitHub Release）
@@ -44,7 +44,7 @@ environment 填 `testpypi`，然后手动触发 workflow 选 `testpypi`。
 TestPyPI 与 PyPI 是两套独立登记，配与不配都不影响正式发布。
 
 **想连 PyPI 都不碰先验证构建**：手动触发 workflow 选 `build-only` —— 只跑
-`uv build` + `twine check --strict` + `check_wheel.py`（验 wheel 里 12 个模块齐全），
+`uv build` + `twine check --strict` + `check_wheel.py`（验 wheel 里 13 个模块齐全），
 不发任何东西。
 
 > 名字写错任何一个字符都会得到 `invalid-publisher` 错误，且**不会**退化成密码登录。
@@ -72,7 +72,7 @@ git push origin main --tags
 ## 三、本地预跑同样的步骤
 
 ```powershell
-# 版本一致性（--all 顺便查 12 个 workspace 成员有没有漂）
+# 版本一致性（--all 顺便查 13 个 workspace 成员有没有漂）
 uv run --no-project python scripts/check_version.py v0.1.1 --all
 
 # 构建 1 个 sdist + 1 个 wheel，并检查元数据与模块齐全
@@ -90,7 +90,7 @@ uv publish --publish-url https://test.pypi.org/legacy/ --token pypi-XXX dist/*
 uv run --no-project python -c "import liorium, liorium.agent, liorium.cli; print(liorium.__version__)"
 ```
 
-## 四、为什么是「一个发行版、12 个模块」
+## 四、为什么是「一个发行版、13 个模块」
 
 - 源码仍按 `packages/<包名>/src/liorium/<子包>` 分目录维护：依赖方向、单元测试、
   `tests/test_architecture.py` 的架构守卫都按模块边界工作，改动面小。
@@ -99,7 +99,7 @@ uv run --no-project python -c "import liorium, liorium.agent, liorium.cli; print
 - 第三方依赖靠 extra 分档（`[all]` / `[mcp]` / `[vector]` / `[openai]` / `[anthropic]` /
   `[google]` / `[images]`）；`core` 与 `vfs` 的**代码**仍然零第三方依赖
   （`tests/test_architecture.py` 钉着），只想要 URI / VFS 时可以把这两个目录单独 vendored。
-- 两条守卫防「发出去少东西」：`tests/test_distribution.py`（force-include 覆盖 12 个模块 +
+- 两条守卫防「发出去少东西」：`tests/test_distribution.py`（force-include 覆盖 13 个模块 +
   版本一致 + 根项目声明了成员包用到的全部第三方依赖）、`scripts/check_wheel.py`
   （对构建产物再验一次模块清单与 entry point）。
 

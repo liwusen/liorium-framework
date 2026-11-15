@@ -107,6 +107,15 @@ def _wrap_error(store: OutputStore, tool_name: str, error: BaseException) -> str
     return f"{TOOL_ERROR_PREFIX}{artifact_id}]"
 
 
+def looks_like_tool_error(content: Any) -> bool:
+    """这段工具输出是不是 :func:`_wrap_error` 的产物（即工具真的抛异常了）。
+
+    工具异常在这里就被兜成字符串，不会往外抛，所以 realm 钩子（``on_tool_end``）
+    只能看返回值形状来判断"这次工具调用失败了"。
+    """
+    return str(content or "").startswith(TOOL_ERROR_PREFIX)
+
+
 def wrap_tool_output(
     tool: BaseTool,
     *,

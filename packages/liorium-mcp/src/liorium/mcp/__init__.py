@@ -18,7 +18,7 @@ agent = LioriumAgent(
         realms=[
             RealmSpec(
                 id="mcp",
-                params={"servers": {"playwright": {"command": "npx", "args": ["@playwright/mcp"]}}},
+                config={"servers": {"playwright": {"command": "npx", "args": ["@playwright/mcp"]}}},
             )
         ],
     ),
@@ -32,7 +32,7 @@ agent = LioriumAgent(
 ```python
 realm = agent.realms.record("mcp").instance
 realm.set_servers([...])          # 或 realm.mark_dirty()
-# 下一次 agent.run(...) 的回合边界会自动重连并替换工具
+# 下一次 agent.push(...) 的回合边界会自动重连并替换工具
 ```
 """
 

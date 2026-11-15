@@ -7,7 +7,8 @@ API 格式的内容提取）、§6（事件 type 总表）。这里只产出 **A
 - ``start`` / ``done`` 由 ``runtime/loop.py`` 在回合边界发；
 - ``compact_*`` 由压缩中间件自己 emit（它知道压缩调用的生命周期），
   本模块**忽略**一切带压缩 tag 的事件，摘要文本绝不进正文 ``delta``；
-- 2026-11-08 起没有宿主事件：``run()`` 的生成器是唯一出口，中断/失败用异常。
+- 2026-11-12 起没有宿主事件：回合事件统一经 ``EventHub`` 扇出，中断/失败由
+  worker 补 ``interrupted`` / ``error`` 终态帧。
 
 硬规则（违反即前端错乱）：
 
@@ -229,6 +230,41 @@ def tool_value_to_text(value: Any) -> str | dict[str, Any]:
         return str(value)
 
 
+TOOL_ERROR_RESULT_PREFIX = "[工具执行出错] "
+"""工具抛异常时 ``tool_result`` 的正文前缀（2026-11-12）。
+
+``on_tool_error`` 以前完全没被翻译：``tool_start`` 会一直悬着，直到回合收尾被
+:meth:`EventTranslator.drain_unfinished` 补成 ``[已中断]`` —— 文案错误（用户会
+以为是自己中途取消的），位置也错（排在后续 delta 之后）。
+"""
+
+
+def tool_error_to_text(value: Any) -> str:
+    """把 ``on_tool_error`` 的 ``error`` 规范成可读文本。
+
+    形状：``[工具执行出错] <类名>: <消息>``（与 ``error`` 事件的 "类名: 消息"
+    一致）；非异常对象（字符串 / dict）照原样序列化，``None`` 退化成只剩前缀。
+
+    **不截断**：这是错误文本的唯一一份，调用方要短自己截（CLI 只显示 400 字符 /
+    5 行）。模型侧看不到这条帧，它拿到的是 LangGraph 自己的错误 ``ToolMessage``。
+    """
+    if isinstance(value, BaseException):
+        detail = f"{type(value).__name__}: {value}"
+    elif value is None:
+        detail = ""
+    elif isinstance(value, str):
+        detail = value
+    else:
+        try:
+            detail = json.dumps(value, ensure_ascii=False)
+        except (TypeError, ValueError):
+            detail = str(value)
+    detail = detail.strip()
+    if not detail:
+        return TOOL_ERROR_RESULT_PREFIX.strip()
+    return f"{TOOL_ERROR_RESULT_PREFIX}{detail}"
+
+
 # ---------------------------------------------------------------------------
 # 翻译器
 # ---------------------------------------------------------------------------
@@ -308,6 +344,8 @@ class EventTranslator:
             return self._translate_tool_start(event)
         if name == "on_tool_end":
             return self._translate_tool_end(event)
+        if name == "on_tool_error":
+            return self._translate_tool_error(event)
         return []
 
     def reset(self) -> None:
@@ -392,6 +430,31 @@ class EventTranslator:
         output = tool_value_to_text(data.get("output"))
         return [ev_tool_result(tool_name, output, call_id)]
 
+    def _translate_tool_error(self, event: dict[str, Any]) -> list[Event]:
+        """``on_tool_error``：工具抛异常（参数校验失败 / 工具节点自身报错）。
+
+        这类调用**不会有** ``on_tool_end``（LangGraph 走的是 error 回调），所以
+        必须在这里用同一条配对逻辑补 ``tool_result``，否则 ``tool_start`` 悬空：
+        收尾时被补成 ``[已中断]``，且位置跑到后续 delta 之后。
+
+        ``call_id`` 的取法与 :meth:`_translate_tool_end` 完全一致（``run_id``
+        优先），因此与对应的 ``tool_start`` 天然成对；``tool_end`` / ``tool_error``
+        先到先算，另一条不会重复发（``_finished`` 去重）。
+        """
+        data = event.get("data") or {}
+        event_tool = _tool_name(event, data)
+        call_id = self._finish_call_id(event, data, event_tool)
+        if call_id in self._finished:
+            return []
+        self._finished.add(call_id)
+        # ``_unmatched`` 是按 start 时的工具名分桶的：先按本条事件的名字配对，
+        # 再换成 start 时记下的名字（error 事件可能压根没带 ``name``）。
+        self._forget_unmatched(event_tool, call_id)
+        tool_name = self._names.get(call_id, event_tool)
+        if tool_name != event_tool:
+            self._forget_unmatched(tool_name, call_id)
+        return [ev_tool_result(tool_name, tool_error_to_text(data.get("error")), call_id)]
+
     # -- call_id --------------------------------------------------------
 
     def _run_id(self, event: dict[str, Any]) -> str:
@@ -444,6 +507,7 @@ __all__ = [
     "EventTranslator",
     "REASONING_BLOCK_TYPES",
     "REASONING_KWARG_KEYS",
+    "TOOL_ERROR_RESULT_PREFIX",
     "event_name",
     "event_tags",
     "extract_reasoning_text",
@@ -452,5 +516,6 @@ __all__ = [
     "is_model_call_start",
     "message_content_to_text",
     "normalize_tool_args",
+    "tool_error_to_text",
     "tool_value_to_text",
 ]

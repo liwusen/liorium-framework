@@ -6,7 +6,7 @@
 # 注释；空行忽略
 LIORIUM_MODEL=Go::deepseek-v4.1-flash
 export LIORIUM_WORKSPACE="D:\\dev\\agent\\liorium"   # 允许 export 前缀与双引号
-LIORIUM_EMBED_KEY='sk-...'                              # 单引号 = 原样
+LIORIUM_CHAT_KEY='sk-...'                               # 单引号 = 原样
 LIORIUM_INBOX=${LIORIUM_WORKSPACE}/.liorium-cli/agent     # ${VAR} 展开（先本次、再环境变量）
 ```
 

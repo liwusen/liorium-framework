@@ -18,8 +18,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from liorium.core.errors import RealmError
 from liorium.core.types import ContextItem
-from liorium.realm_base import BaseRealm, TurnInfo, realm_tool, utc_stamp
+from liorium.realm_base import BaseRealm, RealmMessage, TurnInfo, realm_tool, utc_stamp
 
 from .model import (
     ACTIVE_STATES,
@@ -42,7 +43,7 @@ class TodoRealm(BaseRealm):
     state_scope = "agent"
 
     # 第五拍：每 50 个 run() 给一次机会；第 1 回合先提醒一次（针对从上次启动遗留的待办）。
-    # RealmSpec.params["context_every"] / ["context_first"] 可覆盖（框架认这两个键）。
+    # RealmSpec.config["context_every"] / ["context_first"] 可覆盖（框架认这两个键）。
     context_every = 50
     context_first = True
 
@@ -114,6 +115,39 @@ class TodoRealm(BaseRealm):
 
     def counts(self) -> dict[str, int]:
         return {state: sum(1 for todo in self._items if todo.state == state) for state in STATES}
+
+    # ------------------------------------------------------------------
+    # 宿主消息（2026-11-14）：外部主程序不经模型直接改待办
+    # ------------------------------------------------------------------
+
+    async def on_message(self, message: RealmMessage) -> str:
+        """``agent.send_to_realm("todo", name, data)`` 的落点。
+
+        认四种消息名（``<前缀>.<动作>``，前缀随意，只看最后一段）：
+
+        - ``todo.add``：``{"text": ..., "status"?: ...}``
+        - ``todo.update``：``{"id": ..., "text"?: ..., "status"?: ...}``
+        - ``todo.remove``：``{"id": ...}``
+        - ``todo.list``：``{"include_finished"?: bool}``
+
+        返回与同名工具一致的文本（错误也是 ``错误：…`` 字符串，不抛）；未知消息名抛
+        ``RealmError``（拼错名字要立刻发现）。改动照常触发 ``todo.changed`` 事件帧。
+        """
+        verb = message.name.rsplit(".", 1)[-1].strip().lower()
+        data = message.data
+        if verb == "list":
+            return self.todo_list(include_finished=bool(data.get("include_finished", False)))
+        if verb in ("add", "update", "remove"):
+            return await self.todo(
+                verb,
+                text=str(data.get("text", "") or ""),
+                id=str(data.get("id", "") or ""),
+                status=str(data.get("status", "") or ""),
+            )
+        raise RealmError(
+            f"todo realm 不认识消息 {message.name!r}"
+            "（支持 todo.add / todo.update / todo.remove / todo.list）"
+        )
 
     # ------------------------------------------------------------------
     # 四件套
@@ -208,6 +242,23 @@ class TodoRealm(BaseRealm):
 
     async def _save(self) -> None:
         await self.save(items=[todo.to_dict() for todo in self._items], next_id=self._next)
+        self._emit_changed()
+
+    def _emit_changed(self) -> None:
+        """改完就广播（2026-11-14）：宿主 UI 不用等 50 回合的周期上下文。
+
+        没装进 Agent（``ctx.host is None``）时 ``ctx.emit`` 是空操作，所以这里不判空；
+        事件内容只放可序列化的摘要，全文仍在 ``todos()`` / 状态文件里。
+        """
+        if self.ctx is None:
+            return
+        self.ctx.emit(
+            "todo.changed",
+            {
+                "counts": self.counts(),
+                "ids": [todo.id for todo in self._items],
+            },
+        )
 
     def summary_line(self) -> str:
         """给宿主 ``/status`` 的一行摘要。"""

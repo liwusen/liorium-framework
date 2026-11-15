@@ -1,12 +1,14 @@
 """``liorium-cli`` 入口：参数解析、``.env`` 装载、单轮 / REPL 分发。
 
-配置文件分两层（都可以不存在）：
+配置文件分三层（都可以不存在）：
 
 - ``providers.json``：provider 与密钥（由 :mod:`liorium.cli.setup` 写）；
-- ``config.json``：非密钥设置（默认模型 / 思考 / 记忆 / 技能 / 界面）。
+- ``profile.json``：Agent 装配（模型 / realm / 工具集 / 提示词，2026-11-14 起）；
+- ``config.json``：只剩 UI 偏好（颜色 / 是否隐藏 reasoning）。
 
-优先级：命令行 > 进程环境变量 > ``.env`` > ``config.json`` > 内置默认。
-新机器上第一次运行会建空骨架并进入「未配置」模式，而不是在这里追问 API key。
+优先级：命令行 > 进程环境变量 > ``.env`` > ``profile.json`` / ``config.json`` > 内置默认。
+结构性设置（记忆目录 / 工具子集 / realm 开关）只在 profile 里，命令行 flag 只覆盖本次运行。
+新机器上第一次运行会生成默认 profile 并建空骨架，进入「未配置」模式，而不是在这里追问 API key。
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from typing import Any
 from liorium.provider import catalog_status, describe_thinking, ensure_catalog
 
 from . import config as cli_config
+from . import profile as cli_profile
 from . import setup as cli_setup
 from .config import ConfigError
 from .env import (
@@ -43,6 +46,7 @@ from .providers import (
     ensure_registry,
     normalize_format,
 )
+from .profile import AgentProfile
 from .session import CliOptions, CliSession
 from .ui import Ui, configure_streams
 
@@ -58,29 +62,6 @@ UNCONFIGURED_COMMANDS = [
     ("/help", "显示这段帮助"),
     ("/exit", "退出"),
 ]
-
-
-def _opt_str(
-    config: Mapping[str, Any], key: str, env_name: str, fallback: str | None = None
-) -> str | None:
-    """字符串默认值：环境变量 > ``config.json`` > ``fallback``。"""
-    env_value = env_str(env_name)
-    if env_value:
-        return env_value
-    value = cli_config.get_value(config, key)
-    if value not in (None, ""):
-        return str(value)
-    return fallback
-
-
-def _opt_path(
-    config: Mapping[str, Any], key: str, env_name: str
-) -> Path | None:
-    env_value = env_path(env_name)
-    if env_value is not None:
-        return env_value
-    value = cli_config.get_value(config, key)
-    return Path(str(value)).expanduser() if value else None
 
 
 def _opt_bool(
@@ -102,13 +83,13 @@ def _opt_disabled(
     return not (fallback_enabled if enabled is None else bool(enabled))
 
 
-def _thinking_default(config: Mapping[str, Any]) -> str:
-    """``--thinking`` 的默认值；环境变量 / 配置非法时明确报错。"""
+def _thinking_default(profile: AgentProfile | None) -> str:
+    """``--thinking`` 的默认值：环境变量 > profile.thinking > medium。"""
     if env_bool("LIORIUM_NO_THINKING"):
         return "off"
     raw = (
         env_str("LIORIUM_THINKING")
-        or str(cli_config.get_value(config, "thinking") or "medium")
+        or str(getattr(profile, "thinking", "medium") or "medium")
     ).strip().lower()
     if raw not in THINKING_CHOICES:
         raise ValueError(
@@ -137,7 +118,11 @@ def _models_dev_cache(explicit: Path | None) -> Path:
     return cli_config.cache_dir() / "models_dev" / "api.json"
 
 
-def build_parser(*, config: Mapping[str, Any] | None = None) -> argparse.ArgumentParser:
+def build_parser(
+    *,
+    config: Mapping[str, Any] | None = None,
+    profile: AgentProfile | None = None,
+) -> argparse.ArgumentParser:
     """建参数解析器。
 
     ``config`` 是 ``config.json`` 的内容（``None`` = 不读配置文件）。默认值优先级：
@@ -154,9 +139,8 @@ def build_parser(*, config: Mapping[str, Any] | None = None) -> argparse.Argumen
   liorium-cli
   liorium-cli -p "看看当前目录有什么文件"
   liorium-cli --provider Go --model deepseek-v4.1-flash
-  liorium-cli --skills-dir examples/skills
-  liorium-cli --tools read,find,execute
-  liorium-cli --no-core-tools --no-memory --no-skills --no-todo --no-subagents
+  liorium-cli --profile ./profiles/reviewer.json
+  liorium-cli --no-memory --no-skills --no-todo --no-subagents
   liorium-cli --list-models
   echo "总结 README" | liorium-cli --json
 
@@ -166,14 +150,17 @@ def build_parser(*, config: Mapping[str, Any] | None = None) -> argparse.Argumen
       --model deepseek-chat --api-format openai_chat
   liorium-cli setup providers list|show|edit|rm|default|test|set-key
   liorium-cli setup memory show|set|enable|disable|init
+  liorium-cli setup profile show|path|init|validate|edit|migrate
   liorium-cli setup show | doctor | init | path
 
 配置文件（都可缺省，缺省时用内置默认）:
   ~/.liorium/providers.json   provider 与密钥（0600）
-  ~/.liorium/config.json      非密钥设置；命令行参数与环境变量仍然优先
+  ~/.liorium/profile.json     Agent 装配（模型 / realm / 工具集 / 提示词）
+  ~/.liorium/config.json      只剩 UI 偏好（颜色 / 隐藏 reasoning）
   LIORIUM_HOME                改配置根目录
 
-进入 CLI 后也可以 /setup 交互式配置；全空机器上第一次运行会建空骨架并进入「未配置」模式。
+装配类设置（记忆目录、工具子集、realm 开关）只在 profile 里；命令行 flag 只覆盖本次运行。
+进入 CLI 后也可以 /setup 交互式配置；全空机器上第一次运行会生成默认 profile 并进入「未配置」模式。
 
 等价的模块入口: python -m liorium.cli
 """,
@@ -181,96 +168,58 @@ def build_parser(*, config: Mapping[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument("--env-file", type=Path, default=None, help="从指定 .env 加载配置（默认找 ./.env、./.env.local）")
     parser.add_argument("--no-env", action="store_true", help="不加载任何 .env（只用真实环境变量与命令行）")
     parser.add_argument(
+        "--profile", type=Path, default=None,
+        help="Agent Profile 路径（默认 ./liorium/profile.json 或 ~/.liorium/profile.json）",
+    )
+    parser.add_argument(
         "--config", type=Path, default=env_path("LIORIUM_PROVIDER_CONFIG"),
         help="provider 配置路径（默认 ~/.liorium/providers.json 或 ./providers.json；也可 LIORIUM_PROVIDER_CONFIG）",
     )
     parser.add_argument("--provider", default=env_str("LIORIUM_PROVIDER") or None, help="provider 名（覆盖 main_model 的 provider）")
-    parser.add_argument("--model", default=_opt_str(settings, "model", "LIORIUM_MODEL"), help="模型名或 Provider::model")
+    parser.add_argument(
+        "--model",
+        default=env_str("LIORIUM_MODEL") or (profile.model if profile is not None else None),
+        help="模型名或 Provider::model（默认取 profile 的 model / provider 的 main_model）",
+    )
     parser.add_argument(
         "--api-format", default=env_str("LIORIUM_API_FORMAT") or None,
         help="强制 api 格式（openai_chat/openai_responses/anthropic_messages/google_gemini）",
     )
     parser.add_argument(
-        "--workspace", type=Path, default=_opt_path(settings, "workspace", "LIORIUM_WORKSPACE"),
-        help="工作区根（裸路径与 execute 的 cwd），默认当前目录",
+        "--workspace", type=Path, default=env_path("LIORIUM_WORKSPACE"),
+        help="工作区根（覆盖 profile.workspace；默认 profile 里写的 / 当前目录）",
     )
     parser.add_argument(
-        "--inbox", type=Path, default=_opt_path(settings, "inbox", "LIORIUM_INBOX"),
-        help="Agent 根目录（prompt/checkpoint），默认 <workspace>/.liorium-cli/agent",
+        "--inbox", type=Path, default=env_path("LIORIUM_INBOX"),
+        help="Agent 根目录（覆盖 profile.inbox；默认 profile 里写的 / <workspace>/.liorium-cli/agent）",
     )
     parser.add_argument(
         "--system", type=Path, default=env_path("LIORIUM_SYSTEM"),
         help="用这个文件当 system prompt（替代 inbox/AGENT.md）",
     )
     parser.add_argument(
-        "--no-core-tools",
-        action="store_true",
-        default=env_bool("LIORIUM_NO_CORE_TOOLS"),
-        help="不装配核心工具（read / write / edit / search / find / execute）",
-    )
-    parser.add_argument(
-        "--tools",
-        default=env_str("LIORIUM_TOOLS") or None,
-        help="只装配这些核心工具（逗号分隔，如 read,write,find）；默认六个全给",
-    )
-    parser.add_argument(
         "--no-memory",
         action="store_true",
-        default=_opt_disabled(settings, "memory.enabled", "LIORIUM_NO_MEMORY"),
-        help="不启用长期记忆（memories://）",
+        default=env_bool("LIORIUM_NO_MEMORY"),
+        help="本次不装配长期记忆（memories://；profile 里删掉 memory 条目才是永久关闭）",
     )
     parser.add_argument(
         "--no-skills",
         action="store_true",
-        default=_opt_disabled(settings, "skills.enabled", "LIORIUM_NO_SKILLS"),
-        help="不启用技能库（skills://）",
+        default=env_bool("LIORIUM_NO_SKILLS"),
+        help="本次不装配技能库（skills://）",
     )
     parser.add_argument(
         "--no-todo",
         action="store_true",
-        default=_opt_disabled(settings, "todo.enabled", "LIORIUM_NO_TODO"),
-        help="不启用待办（todo / todo_list 工具，及每 50 回合的待办提醒）",
+        default=env_bool("LIORIUM_NO_TODO"),
+        help="本次不装配待办（todo / todo_list 工具，及每 50 回合的待办提醒）",
     )
     parser.add_argument(
         "--no-subagents",
         action="store_true",
-        default=_opt_disabled(settings, "subagents.enabled", "LIORIUM_NO_SUBAGENTS"),
-        help="不启用子代理（newSubagent / invokeSubagent）",
-    )
-    parser.add_argument(
-        "--memory-dir", type=Path, default=_opt_path(settings, "memory.dir", "LIORIUM_MEMORY_DIR"),
-        help="记忆库目录（默认 <inbox>/memory）",
-    )
-    parser.add_argument(
-        "--embed-model",
-        default=_opt_str(settings, "memory.embed_model", "LIORIUM_EMBED_MODEL", ""),
-        help="embedding 模型（如 text-embedding-3-small）；给了才启用语义检索",
-    )
-    parser.add_argument(
-        "--embed-base-url",
-        default=_opt_str(settings, "memory.embed_base_url", "LIORIUM_EMBED_BASE_URL", ""),
-        help="embedding 的 OpenAI 兼容 base_url（默认跟随当前 provider）",
-    )
-    parser.add_argument(
-        "--embed-key",
-        default=_opt_str(settings, "memory.embed_key", "LIORIUM_EMBED_KEY", ""),
-        help="embedding 的 API key（默认跟随当前 provider）",
-    )
-    parser.add_argument(
-        "--no-vectors",
-        action="store_true",
-        default=_opt_disabled(settings, "memory.vectors", "LIORIUM_NO_VECTORS"),
-        help="不建向量索引（只跑关键词检索）",
-    )
-    parser.add_argument(
-        "--no-extraction",
-        action="store_true",
-        default=_opt_disabled(settings, "memory.extraction", "LIORIUM_NO_EXTRACTION"),
-        help="写记忆后不自动抽实体/关系",
-    )
-    parser.add_argument(
-        "--skills-dir", type=Path, default=_opt_path(settings, "skills.dir", "LIORIUM_SKILLS_DIR"),
-        help="技能目录（默认 <inbox>/skill.d；示例: examples/skills）",
+        default=env_bool("LIORIUM_NO_SUBAGENTS"),
+        help="本次不装配子代理（newSubagent / invokeSubagent）",
     )
     parser.add_argument("-p", "--prompt", default=env_str("LIORIUM_PROMPT") or None, help="单轮模式：执行一次后退出")
     parser.add_argument("--json", action="store_true", default=env_bool("LIORIUM_JSON"), help="事件以 JSON Lines 输出（不渲染）")
@@ -284,7 +233,7 @@ def build_parser(*, config: Mapping[str, Any] | None = None) -> argparse.Argumen
     parser.add_argument(
         "--thinking",
         choices=THINKING_CHOICES,
-        default=_thinking_default(settings),
+        default=_thinking_default(profile),
         help="思考强度（默认 medium；off 关闭）",
     )
     parser.add_argument(
@@ -300,8 +249,24 @@ def build_parser(*, config: Mapping[str, Any] | None = None) -> argparse.Argumen
         default=_opt_bool(settings, "ui.hide_reasoning", "LIORIUM_HIDE_REASONING", False),
         help="只隐藏 reasoning_delta 显示（不改变是否请求思考）",
     )
-    parser.add_argument("--temperature", type=float, default=env_float("LIORIUM_TEMPERATURE", 0.3), help="采样温度（默认 0.3；思考开启时不发送）")
-    parser.add_argument("--max-turns", type=int, default=env_int("LIORIUM_MAX_TURNS", 500), help="单回合模型调用上限（默认 500）")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=env_float(
+            "LIORIUM_TEMPERATURE",
+            profile.temperature if profile is not None else 0.3,
+        ),
+        help="采样温度（默认取 profile；思考开启时不发送）",
+    )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=env_int(
+            "LIORIUM_MAX_TURNS",
+            profile.limits.max_turns if profile is not None else 500,
+        ),
+        help="单回合模型调用上限（默认取 profile.limits.max_turns）",
+    )
     parser.add_argument(
         "--models-dev",
         choices=MODELS_DEV_CHOICES,
@@ -368,18 +333,6 @@ def _scan_env_args(argv: Sequence[str]) -> tuple[Path | None, bool]:
             env_file = Path(arg.split("=", 1)[1])
         index += 1
     return env_file, use_env
-
-
-def _parse_tools(raw: str | None) -> tuple[str, ...]:
-    """``--tools read,write`` → ``("read", "write")``（保持顺序、去重）。"""
-    if not raw:
-        return ()
-    names: list[str] = []
-    for item in str(raw).split(","):
-        name = item.strip()
-        if name and name not in names:
-            names.append(name)
-    return tuple(names)
 
 
 async def _prepare_registry(registry: ProviderRegistry, args: argparse.Namespace) -> None:
@@ -532,6 +485,71 @@ async def _unconfigured_repl(
             ui.info("记忆设置已保存；还差 provider 才能开始对话（/setup providers）")
 
 
+def _scan_flag_path(argv: Sequence[str], flag: str) -> Path | None:
+    """在 argparse 之前扫一个路径 flag（``--profile`` / ``--config``）。"""
+    for index, item in enumerate(argv):
+        if item == flag and index + 1 < len(argv):
+            return Path(argv[index + 1]).expanduser()
+        if item.startswith(f"{flag}="):
+            return Path(item.split("=", 1)[1]).expanduser()
+    return None
+
+
+def _scan_profile_arg(argv: Sequence[str]) -> Path | None:
+    return _scan_flag_path(argv, "--profile")
+
+
+def _scan_config_arg(argv: Sequence[str]) -> Path | None:
+    return _scan_flag_path(argv, "--config")
+
+
+def _migrate_profile(profile_path: Path, provider_hint: Path) -> Path | None:
+    """首次启动：把旧 ``config.json`` 的装配字段迁到 profile（一次）。"""
+    from .providers import load_registry
+
+    resolved = None
+    try:
+        if provider_hint.is_file():
+            registry, _tried = load_registry(provider_hint)
+            if registry is not None:
+                resolved = registry.resolve(registry.default_label())
+    except Exception:  # noqa: BLE001 - 迁移不应因为 provider 没配好而失败
+        resolved = None
+    try:
+        return cli_config.migrate_to_profile(
+            config_path=cli_config.config_path(),
+            profile_path=profile_path,
+            provider_file=str(provider_hint),
+            provider_base_url=str(getattr(resolved, "base_url", "") or ""),
+            provider_key=str(getattr(getattr(resolved, "provider", None), "key", "") or ""),
+        )
+    except ConfigError as exc:
+        print(f"配置迁移失败: {exc}", file=sys.stderr)
+        return None
+
+
+def _resolve_workspace(args: argparse.Namespace, profile: AgentProfile) -> Path:
+    if args.workspace is not None:
+        return args.workspace.expanduser().resolve()
+    raw = profile.workspace
+    if raw:
+        path = Path(raw).expanduser()
+        return path if path.is_absolute() else (profile.base_dir / path).resolve()
+    return Path.cwd().resolve()
+
+
+def _resolve_inbox(
+    args: argparse.Namespace, profile: AgentProfile, workspace: Path
+) -> Path:
+    if args.inbox is not None:
+        return args.inbox.expanduser().resolve()
+    raw = profile.inbox
+    if raw:
+        path = Path(raw).expanduser()
+        return path if path.is_absolute() else (workspace / path).resolve()
+    return (workspace / ".liorium-cli" / "agent").resolve()
+
+
 async def _cold_start(
     args: argparse.Namespace,
     *,
@@ -579,22 +597,51 @@ async def run_cli(
         for warning in env_report.warnings:
             print(f".env 提示: {warning}", file=sys.stderr)
 
-    # ``config.json`` 必须在建 parser 之前读：argparse 的 ``default=`` 建 parser 时求值。
     try:
         settings = cli_config.load_config()
     except ConfigError as exc:
         print(f"配置错误: {exc}", file=sys.stderr)
         return 2
 
+    created: dict[str, Any] = {}
+    explicit_profile = _scan_profile_arg(raw_argv)
+    profile_path = cli_profile.resolve_profile_path(explicit_profile)
+    if not profile_path.is_file():
+        try:
+            created = cli_config.ensure_home()
+        except OSError as exc:
+            print(f"配置目录创建失败: {exc}", file=sys.stderr)
+            return 2
+        provider_hint = (
+            _scan_config_arg(raw_argv) or cli_config.providers_path()
+        ).expanduser().resolve()
+        moved = _migrate_profile(profile_path, provider_hint)
+        if moved is None:
+            cli_profile.ensure_profile(profile_path, provider_file=str(provider_hint))
+        else:
+            # 迁移只在第一次启动发生；提示走 stderr，别弄脏 --json 的 stdout。
+            backup = cli_config.config_path().with_suffix(
+                cli_config.config_path().suffix + ".bak"
+            )
+            print(
+                f"已把 config.json 的装配设置迁移到 profile: {moved}"
+                f"（原文件备份: {backup}；之后改 profile 就不再读这些旧键）",
+                file=sys.stderr,
+            )
+        created["profile"] = profile_path
+
     try:
-        parser = build_parser(config=settings)
+        profile = AgentProfile.load(profile_path)
+    except Exception as exc:  # noqa: BLE001 - ProfileError
+        print(f"profile 错误: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        parser = build_parser(config=settings, profile=profile)
     except ValueError as exc:
         print(f"配置错误: {exc}", file=sys.stderr)
         return 2
     args = parser.parse_args(raw_argv)
-    if args.no_core_tools and args.tools:
-        print("配置错误: --tools 与 --no-core-tools 不能同时使用", file=sys.stderr)
-        return 2
 
     configure_streams()
     if os.name == "nt":
@@ -602,20 +649,21 @@ async def run_cli(
 
     interactive_mode = sys.stdin.isatty() if interactive is None else interactive
 
-    # 新机器：先把配置骨架建出来（已存在的不动），再判断能不能起会话。
-    created: dict[str, Any] = {}
-    if args.config is None:
-        try:
-            created = cli_config.ensure_home()
-        except OSError as exc:
-            print(f"配置目录创建失败: {exc}", file=sys.stderr)
-            return 2
-
     loaded = registry is None
     tried: list[Path] = []
+    provider_file = args.config or (
+        Path(profile.provider_file).expanduser() if profile.provider_file else None
+    )
+    if provider_file is not None and not provider_file.is_file():
+        print(
+            f"provider 文件不存在: {provider_file}"
+            "（改 profile.provider_file，或用 --config 指定）",
+            file=sys.stderr,
+        )
+        return 2
     try:
         if loaded:
-            registry, tried, registry_created = ensure_registry(config=args.config)
+            registry, tried, registry_created = ensure_registry(config=provider_file)
             created = {**created, **registry_created}
     except ProviderConfigError as exc:
         print(f"配置错误: {exc}", file=sys.stderr)
@@ -632,6 +680,12 @@ async def run_cli(
         if isinstance(outcome, int):
             return outcome
         registry = outcome
+        # 向导可能刚刚写好 / 迁移好 profile：重新读一次。
+        try:
+            profile = AgentProfile.load(profile_path)
+        except Exception as exc:  # noqa: BLE001
+            print(f"profile 错误: {exc}", file=sys.stderr)
+            return 2
 
     if loaded:
         try:
@@ -648,12 +702,15 @@ async def run_cli(
         print(f"模型解析失败: {exc}", file=sys.stderr)
         return 2
 
-    workspace = (args.workspace or Path.cwd()).expanduser().resolve()
-    inbox = (args.inbox or (workspace / ".liorium-cli" / "agent")).expanduser().resolve()
+    workspace = _resolve_workspace(args, profile)
+    inbox = _resolve_inbox(args, profile, workspace)
     one_shot = args.prompt is not None or not interactive_mode
     options = CliOptions(
         workspace=workspace,
         inbox=inbox,
+        workspace_explicit=args.workspace is not None,
+        inbox_explicit=args.inbox is not None,
+        profile_path=profile_path,
         system_prompt=args.system,
         temperature=args.temperature,
         max_turns=args.max_turns,
@@ -663,22 +720,13 @@ async def run_cli(
         color=not args.no_color,
         # 单轮/管道模式不打印 banner，保持输出干净（JSON 模式本来也不打印）
         show_banner=not one_shot,
-        enable_core_tools=not args.no_core_tools,
-        tools=_parse_tools(args.tools),
         enable_memory=not args.no_memory,
         enable_skills=not args.no_skills,
         enable_todo=not args.no_todo,
         enable_subagents=not args.no_subagents,
-        memory_dir=args.memory_dir,
-        skills_dir=args.skills_dir,
-        embed_model=args.embed_model,
-        embed_base_url=args.embed_base_url,
-        embed_key=args.embed_key,
-        enable_vectors=not args.no_vectors,
-        enable_extraction=not args.no_extraction,
         models_dev_cache=_models_dev_cache(args.models_dev_cache),
         config_file=cli_config.config_path(),
-        providers_file=args.config or cli_config.providers_path(),
+        providers_file=provider_file or cli_config.providers_path(),
         env_report=env_report or None,
     )
     session = CliSession(
@@ -687,6 +735,7 @@ async def run_cli(
         options,
         input_fn=input_fn,
         model_factory=model_factory,
+        profile=profile,
     )
 
     try:

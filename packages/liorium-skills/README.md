@@ -13,7 +13,7 @@ Liorium 技能能力包（`[skills]` extra）。挂载点 `/skills` ⇔ `skills:
 
 技能清单（`skills()`）会预载进 system prompt 的「技能清单」段（计划 §F2），
 所以装/卸技能 ⇒ 提示词变化 ⇒ `CacheEpoch +1`。清单最多
-`RealmSpec.params["max_prompt_skills"]` 条（默认 20），超出部分给一句提示。
+`RealmSpec.config["max_prompt_skills"]` 条（默认 20），超出部分给一句提示。
 
 ## 用法
 
@@ -34,7 +34,7 @@ agent = LioriumAgent(
 )
 ```
 
-自定义目录：`RealmSpec(id="skills", params={"skills_dir": "elsewhere"})`。
+自定义目录：`RealmSpec(id="skills", config={"skills_dir": "elsewhere"})`（profile 里写 `realms[skills].config.skills_dir`）。
 
 模型侧：
 

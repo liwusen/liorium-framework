@@ -23,7 +23,7 @@ Liorium 记忆能力包。挂载点 `/memories` ⇔ `memories://`。
 
 能力四件套：**工具 + VFS 挂载 + 状态（`state_scope="agent"`）+ `prompt_fragment()`**。
 状态文件在 `<inbox>/realm_state/memory.json`；库默认在 `<inbox>/memory/memory.sqlite`
-（`RealmSpec.params` 的 `db_path` / `content_dir` 可覆盖）。
+（`RealmSpec.config` 的 `db_path` / `content_dir` 可覆盖）。
 
 ## 用法
 
@@ -44,24 +44,39 @@ agent = LioriumAgent(
 )
 ```
 
-要语义检索 / 实体抽取，就在工厂里注入服务（**服务对象不进 `params`**，params 要参与指纹）：
+要语义检索 / 实体抽取，**不用注入服务**：写 `config` 就行（realm 在 `start()` 里自组装）。
 
 ```python
-from liorium.memory import MemoryRealm
-from liorium.memory.embeddings import OpenAICompatibleEmbeddings
-from liorium.memory.extract import LlmExtractor
-from liorium.memory.vectors import NanoVectorBackend
-
-def memory_realm(spec):
-    root = Path("agents/main/memory")
-    return MemoryRealm(
-        spec,
-        embedder=OpenAICompatibleEmbeddings(model="text-embedding-3-small", api_key=...),
-        vectors=NanoVectorBackend(root / "index/chunks.vdb"),
-        entity_vectors=NanoVectorBackend(root / "index/entity.vdb"),
-        extractor=LlmExtractor(chat=my_chat),   # async (system, user) -> str
-    )
+agent = LioriumAgent(
+    spec=AgentSpec(
+        id="main",
+        inbox_dir=Path("agents/main"),
+        model="deepseek::chat",
+        realms=[
+            RealmSpec(
+                id="memory",
+                config={
+                    "dir": "D:/data/memory",          # 默认 <inbox>/memory
+                    "embed": {
+                        "model": "text-embedding-3-small",
+                        "base_url": "https://api.openai.com/v1",
+                        "api_key": os.environ["OPENAI_API_KEY"],
+                    },
+                    "extraction": True,               # 用 ctx.model 抽实体
+                },
+            )
+        ],
+    ),
+    model_factory=make_chat_model,
+    compact_model_factory=make_compact_model,   # ctx.model → 抽取/摘要用的 aux 模型
+    realm_factories={"memory": MemoryRealm},
+)
 ```
+
+`MemoryRealm.Config = MemoryConfig`（pydantic，`extra="forbid"`）：profile 的 `load()` 会用它
+校验并补默认值。`embed` 缺省 = 只跑关键词检索；`extraction` 缺省 `true`，但没有 `ctx.model`
+时自动关闭。自己造的服务由 `stop()` 关闭；宿主仍可显式注入 `embedder=` / `vectors=` /
+`extractor=` 覆盖（注入的优先，且不由 realm 关闭）。
 
 模型侧的行为：
 
@@ -76,7 +91,7 @@ def memory_realm(spec):
 - **关键词**：FTS5 倒排在 `index/fts.sqlite`（中文二元组 + 单字，2 字/1 字查询都能命中），
   常驻只有页缓存（默认 20MB）；
 - **语义**：`index/chunks.vdb`（nano-vectordb 格式，与既有实现逐字节兼容），全量矩阵在内存是它的固有代价
-  → 惰性加载 + 延迟落盘 + `unload()` + `params["vectors"]=False` 只跑关键词；
+  → 惰性加载 + 延迟落盘 + `unload()` + `config["vectors"]=False` 只跑关键词；
 - **融合**：RRF（只看位次），再叠 `score_patch`、新鲜度、标签；**没有 rerank**。
 
 ## 已知边界

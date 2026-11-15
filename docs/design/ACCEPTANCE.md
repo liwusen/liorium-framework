@@ -84,7 +84,7 @@ tests/test_live_agent.py::test_live_tool_cycle    PASSED  [9.8s]
 | 3 | `liorium-mcp`：客户端 + 运行时发现工具 | ✅ | `packages/liorium-mcp/tests/test_mcp_schema.py`（6：JSON Schema→pydantic）；`test_mcp_realm.py`（8：前缀命名/调用/单 server 降级/全失败 strict/禁用） |
 | 4 | MCP「宿主 mark dirty」接法（回合边界重连换工具） | ✅ | `test_mcp_realm.py::test_mark_dirty_reconnects_new_servers`（新增 server → `refresh()` 后工具出现、旧 client 被关）；`packages/liorium-agent/tests/test_realm_v11.py::test_mcp_like_refresh_hook_is_awaited`（`async refresh()` 先于取工具执行、epoch +1） |
 | 5 | `conversation` scope | ✅ | `test_realm_v11.py::test_conversation_scope_state_resets_on_reset_dialog`（`reset_dialog()` 清空 conversation scope、保留 agent scope）；`test_realm_manager.py` 的路径/非法 scope/重置用例 |
-| 6 | profile 语法糖 | ✅ | `packages/liorium-agent/tests/test_profile.py`（9：合并顺序/显式声明优先/指纹变化/空 profile/重复报错） |
+| 6 | profile 语法糖 | ⚠️ 已删除 | 2026-11-14 起由 Agent Profile（`liorium-profile`）取代，见文末「变更（十二）」；旧 `Profile` / `AgentSpec.with_profile` 与 `packages/liorium-agent/tests/test_profile.py` 一并删除 |
 | 7 | 多 Agent 示例（2 个 `LioriumAgent` + 调用方 semaphore） | ✅ | `examples/multi_agent.py`（`run_agents` 用 `asyncio.Semaphore` 包住整回合的 `async for`）；`tests/test_multi_agent_example.py`（2：两个输出、各自 inbox/checkpoint + 事件） |
 | 8 | 端到端：能力包装到 Agent 上（假模型） | ✅ | `tests/test_v11_integration.py`（2：写记忆 → 读 → 列目录带元数据 → 检索 → 列技能 → 装技能后 dirty 刷新并 epoch +1；`edit` 走 VFS handler 改 SQLite 正文） |
 
@@ -214,3 +214,310 @@ flags: FLAG = FLAG.NONE)`；`TurnScheduler.acquire(priority, flags, on_preempt)`
 ```
 
 3 个 skip 与 v1.0 相同：2 个真模型用例（未设 `OPENCODE_GO_KEY`）+ 1 个 Pillow 缩放用例。
+
+## 2026-11-12 变更（六）：事件流原生
+
+按定稿 `__dev__/Liorium Event 事件流原生 定稿.md` 把"调用方驱动的回合生成器"换成
+"自持 worker + 入站队列 + 只读事件流"。上面 §「2026-11-08 变更（四）」与「（五）」是历史记录，
+本文不动它们；本节的删除项正是那两节里新增的调度面。
+
+**删除**：`LioriumAgent.run()`（调用方 `async for` 驱动回合的入口）、`priority`（构造参数 /
+`run(priority=...)` / 子代理的 `parent.priority - 1`）、`FLAG.INTERRUPTING`、
+`FLAG.DROPPABLE`、`DEFAULT_FLAGS`、`TurnDropped`、`TurnScheduler` 的优先级堆与抢占判定
+（`acquire(priority, flags, on_preempt)` / `on_preempt` 回调）。**不留兼容层。**
+
+**新增**：`LioriumAgent.push()`（同步、`id` 必填、`bucket` / `flags` / `timeout` / `context`）、
+`stream()`（同步返回订阅对象、可多个、不回放、`ids` 过滤、每订阅者无界队列）、`inject()` 改为
+同步底层通道；`runtime/inbox.py`（`Bucket` / `Flag` / `Entry` / `Inbox` / `BatchWindow` /
+`QUEUE_MAX=50` / 同 id 原位替换 / 惰性 `timeout`）、`runtime/hub.py`（`EventHub` /
+`Subscription` / `put_nowait` 扇出 / `close()`）、`runtime/worker.py`（`TurnWorker`：常驻单执行
+位、终态帧补齐、`IMMEDIATE` 抢占、维护插队、合批冲刷）、`runtime/scheduler.py` 退化为
+`ExecSlot`（单执行位 + `exclusive` + 维护队列）。事件类型从 9 → **13**：新增
+`round_aborted`（非终态）、`interrupted`、`error`、`input`；`start` 增 `origin` / `inputs`。
+`LioriumAgent(batch_window=...)` 不进 `AgentSpec`（不参与指纹）；
+`status()` 的 `queue_depth` 改为 Inbox 深度，新增 `pending_by_bucket`。
+
+**不变量**：每个回合恰好一条终态帧（`done` / `interrupted` / `error`）且是该回合最后一条；
+`IMMEDIATE` 永不结束回合（只切模型轮 + 补 `round_aborted`，`turn_id` 不变）；工具执行中不打断
+（等整组工具跑完，在安全点注入）；`close()` 丢弃 pending 不发帧、`interrupt()` 保留队列；
+发布者永不等待消费者（慢订阅者只影响它自己）；没人订阅时回合照常跑。
+
+| 证据 | 说明 |
+|---|---|
+| `packages/liorium-agent/tests/test_event_hub.py` | 多订阅者各收全量；不回放；慢订阅者不阻塞；异常隔离；`close()` 结束订阅 |
+| `packages/liorium-agent/tests/test_inbox.py` | 桶映射与 `opens_turn`；同 id 原位替换与合批锚点继承；`timeout` 过期（patch monotonic）不连坐；`DROPPABLE` 阈值；`AUTO` 与 `IMMEDIATE` 互斥；四旋钮合批 |
+| `packages/liorium-agent/tests/test_worker.py` | FIFO；`IMMEDIATE` 四相位（含"工具中不打断"与"已发 delta 保留前缀"）；`EXCLUSIVE` 不被抢；维护插队；`reset_dialog` 清队 + 逐条 `dropped`；终态帧恰好一次；`close()` 发 `interrupted(close)` |
+| `packages/liorium-agent/tests/test_buckets.py` | P3 起取代 `test_scheduler.py` / `test_turn_flags.py`：Agent 级 bucket / flags 行为与终态帧 |
+| `tests/test_event_contract.py` | 14 种事件类型金样；`round_aborted` / `interrupted` / `error` / `input` / `realm` 字段冻结 |
+
+文档：新增 [event-stream.md](event-stream.md)（权威）；[scheduler.md](scheduler.md) 改为
+"单执行位 + bucket 队列"；`API.md` / `ARCHITECTURE.md` / `GUIDE.md` / `EXTENDING.md` /
+`README.md` / `INTERFACES.md` 的 `run()` / `priority` / `FLAG` 段落同步改写。
+
+## 2026-11-12 变更（七）：工具异常也发 `tool_result`
+
+`EventTranslator` 只翻译了 `on_tool_end`，`on_tool_error` 完全没接：工具抛异常（参数校验失败、
+工具节点自身报错）时 `tool_start` 一直悬着，直到回合收尾被 `drain_unfinished()` 补成 `[已中断]`
+—— 文案误导（看起来像用户取消了），位置也错（排在后续 delta 之后）。
+
+现在 `on_tool_error` 与 `on_tool_end` 走同一条配对逻辑（`run_id` 优先，`_finished` 去重、
+先到先算）：正文 `[工具执行出错] <类名>: <消息>`（`tool_error_to_text`），与 `error` 事件的
+"类名: 消息" 形态一致。工具**体内**的异常本来就由 `wrap_tool_output()` 变成可读结果（走
+`on_tool_end`），这条补的是"根本没跑进工具体"的那一类。
+
+| 证据 | 说明 |
+|---|---|
+| `packages/liorium-agent/tests/test_stream_translation.py`（+4） | `on_tool_error` 补对 `tool_result` 且收尾不再补 `[已中断]`；error 事件缺 `name` 时回落 start 的工具名；`end` 先到则忽略后到的 `error`；`tool_error_to_text` 四种入参 |
+| `tests/test_agent.py`（+1） | 真回合里给 `read` 传错参数：`tool_result` 是 `[工具执行出错] ValidationError…`，且排在 delta 之前 |
+
+## 2026-11-13 变更（八）：`BATCHED` 到期开回合
+
+变更（六）里 `BATCHED` 被定义成"只做 context、永不开回合"：窗口到期后把内容注入
+`ContextChannel`，等下一个回合开始时搭车。这把参照实现（Cortico）的两个档位杂交了 ——
+它的 `debounce` 是"到期即投递、投递即开回合"，"攒着但永不主动说话"是 `piggyback`，而
+`piggyback` 根本不参与合批。结果是：只要没有别的条目来开回合，攒下来的批次**永远等不到**
+（`_flush_batch()` 发的那条 `input.delivered` 还带 `turn_id=None`，没有归属回合）。
+
+现在窗口到期后按 `AUTO` 处理（**只加开回合，不加中途注入**）：
+
+| 时刻 | 行为 |
+|---|---|
+| 窗口到期、没有回合在跑 | **开一个新回合**：整批各条 `text` 按队列序换行拼接成一条普通 user 消息，各自的 `context` 与搭车的 `ENVIRONMENT` 并入同一条 |
+| 窗口到期、有回合在跑 | 留在 Inbox 排队，当前回合结束、且没有别的开回合条目时再开 |
+| 窗口到期、已有 `MAJOR` / `IMMEDIATE` 在排队 | 不单独开回合；整批按形态①并入那一条开启的回合（一个批次不产生两个回合） |
+| 整批只有 `ENVIRONMENT` | 永不开回合（`batch_due()` 要求至少一条 `BATCHED`） |
+
+**代码**：`Bucket.opens_turn` 改为 `self is not Bucket.ENVIRONMENT`；`Entry` 增 `input_ids`
+（批回合一次代表整批）；`Inbox.take_due_batch()` 取整批；`TurnWorker._take_batch_turn()` 合成
+批回合条目，`_id_frames()` 按 `start.inputs` 逐条补 `input.delivered`；**删除** `_flush_batch()`
+（职责被 `_take_batch_turn()` 完全取代）。**行为变化**：`input.delivered` 现在恒带本回合
+`turn_id`（不再有冲刷时的 `turn_id=None`）；`status().pending_by_bucket["BATCHED"]` 是排队期
+唯一可见性（没有"自动开口次数"计数器）。
+
+**不做**（与参照实现一致）：回合中途注入（`WakeBus` 的批次只在主循环顶部被取走，回合内能插
+进来的只有 `preempt` / `interrupt`，那是"整批投递 + 取消当前轮"）；`ENVIRONMENT` 开回合；
+"自动开口"的速率上限 / 闸门原语（Cortico 的 `DeliveryGate` 只记录在案）。已知风险：把
+`quiet_gap` 调得很小等于"每次窗口到期一次模型调用"（默认 2.5 s 下最坏约 24 回合/分钟），
+旋钮仍在调用方手里。
+
+| 证据 | 说明 |
+|---|---|
+| `packages/liorium-agent/tests/test_inbox.py`（+2，改 1） | `BATCHED.opens_turn is True`；`take_due_batch()` 未到期返回 `[]` 且队列不动、到期返回整批（`BATCHED` + `ENVIRONMENT`，队列序、`MAJOR` 不受影响）；只有 `ENVIRONMENT` 时恒 `[]` |
+| `packages/liorium-agent/tests/test_worker.py`（+2，改 1） | `test_batched_opens_turn_when_idle`：一批恰好一个回合、`start.inputs == [b1, b2, e1]`、正文换行拼接、`ENVIRONMENT` 进同一条 user 消息、`delivered` 帧带本回合 `turn_id`；`test_batched_waits_for_running_turn`：回合在跑时窗口到期不插进去，`done` 之后才出现第二个 `start`；原"永远不开回合"用例改为"窗口内不开 + 并入 `MAJOR` 回合" |
+| `packages/liorium-agent/tests/test_buckets.py`（+2，改 2） | `test_all_but_environment_open_turns`；`ENVIRONMENT` 永不开回合与 `BATCHED` 窗口未到期不开回合拆成两条；`test_batched_turn_inputs_cover_whole_batch`：只订阅整批里第二条也能收到整个回合（`start.inputs` 契约） |
+
+文档：`event-stream.md` §4.1 / §4.3 / §5.1 / §7 / 附录 A / 附录 B，`scheduler.md` 开头，
+`API.md` 的 `Bucket` 代码块与语义表，`GUIDE.md` / `README.md` / `EXTENDING.md` /
+`packages/liorium-agent/README.md` 中"`BATCHED` 不开回合"的段落。
+
+全量：`.\.venv\Scripts\python.exe -m pytest -q -m "not live"` → **1332 passed, 3 skipped,
+3 deselected**（变更（六）基线 1326 → +6）。
+
+## 2026-11-13 变更（九）：`ENVIRONMENT` 回合中途注入
+
+变更（六）/（八）之后，`ENVIRONMENT` 只在回合开始时搭车：回合进行中 push 的环境快照（观众数、
+当前页面）要等本回合结束、下一个回合开始才被模型看见 —— 一个长回合（长工具链）里可能迟到
+几十秒。现在给它一条**节流的中途通道**，取值逻辑一条不动（永不开回合、不刷新合批计时器、
+不影响 `next_wakeup()`）：
+
+| 时刻 | 行为 |
+|---|---|
+| 回合开始 | 无条件取走全部 `ENVIRONMENT`，并入 user 消息（形态①）；**不受节流**，但会重置计时器 |
+| 批回合到期 | 随整批一起取走（现有行为，同样重置计时器） |
+| 回合进行中（安全点） | 距上次投递满 `env_interval`（默认 30 s）⇒ 取走全部 `ENVIRONMENT`，物化成**独立** `<context>` user 消息（形态②） |
+| 未满间隔 | 返回 `[]`，队列一格不动，等下一次安全点或回合结束兜底 |
+| 空闲（没有回合在跑） | 不投递、不唤醒：没有定时器，`next_wakeup()` 与 `_idle()` 都不变 |
+
+**实现**：`Inbox(env_interval=30.0)` + `_env_at`（按"上一次**投递**"计时，不是"上一次 push"；
+首次投递立即可投；`<= 0` ⇒ 每次安全点都投）；`take_environment()` 未到期返回 `[]`；
+三条投递路径统一走 `_take_context()`，只要真的投递过 `ENVIRONMENT` 就重置计时器。
+`ContextMergeMiddleware` 增加 `env_context` 回调，在 `before_model` 里与 `inject()` 的 pending
+合流成**一条**消息；`TurnWorker.pull_env_context()` 先扫过期（`input.expired` 照常发）再取用，
+避免把过期快照当新鲜数据注入。`LioriumAgent(env_interval=...)` 透传，**不进 `AgentSpec`**。
+
+不引入 provider / 快照函数 / 后台任务：内容仍只由 `push(bucket=ENVIRONMENT)` 提供；每个 Agent
+自带 `Inbox` ⇒ 子代理自动同样生效、各自独立计时，构造点零改动。
+
+**行为变化**：回合进行中 push 的 `ENVIRONMENT` 不再一律留给下一个回合（默认 30 s 内至多一次，
+首次立即）；`input.expired` 可能落在回合内（环境取用前会先扫过期），不再固定排在回合之后。
+
+**已知取舍**：注入不增加模型调用次数，但每条都是一条新 user 消息（token 成本，长回合里可达
+数条）；真实延迟上界是"`env_interval` + 到下一个安全点的距离"（模型正在出长文本或慢工具时
+要等它结束），不是 30 秒硬实时。
+
+| 证据 | 说明 |
+|---|---|
+| `packages/liorium-agent/tests/test_inbox.py`（+3） | `take_environment()` 未到期返回 `[]` 且队列不动、到期取走全部 `ENVIRONMENT`（不碰 `BATCHED` / `MAJOR`）；`pop_context_entries()` / `take_due_batch()` 投递过环境后计时器重置（`env_due()` 变假）；`env_interval=0` 每次都能投 |
+| `packages/liorium-agent/tests/test_worker.py`（+2，改 1） | `test_environment_injected_mid_turn`：回合中途 push ⇒ 仍只有一个 `start`（`inputs` 不含环境 id）、下一秒模型调用前多一条独立 `<context>` 消息、`input.delivered` 带本回合 `turn_id`、`done` 恰好一条；`test_environment_throttled_mid_turn`：`env_interval=100` 时中途不注入、留队列，下一回合开始时按形态①搭车（`start.inputs == ["m1","e1"]`）；`test_expired_entry_is_never_materialized` 改为在回合帧流里找 `input.expired` |
+| `packages/liorium-agent/tests/test_buckets.py`（+1，改 2） | `test_environment_injected_mid_turn_keeps_single_turn`（不新开回合、`pending_by_bucket` 清零）；过期用例同上改法；`test_status_queue_depth_and_bucket_breakdown` 的 `start.inputs` 由 `["m","b","e"]` 改为 `["m","b"]`（环境已在 `A` 回合注入） |
+
+文档：`event-stream.md` §4.1（新增一段投递时机）/ §4.3 / §5.1 / 附录 A，`API.md` 的
+`LioriumAgent` 参数表与 `Bucket` / `BatchWindow` 代码块，`GUIDE.md`、`README.md`、
+`EXTENDING.md`、`scheduler.md`、`packages/liorium-agent/README.md`，以及
+`__dev__/Liorium Event 事件流原生 定稿.md` §4.1 的「2026-11-13 修订（二）」标注。
+
+全量：`.\.venv\Scripts\python.exe -m pytest -q -m "not live"` → **1338 passed, 3 skipped,
+3 deselected**（变更（八）基线 1332 → +6）。
+
+## 2026-11-14 变更（十）：realm 主动能力（`realm` 帧 / 推送 / 中断 / 只读钩子）
+
+变更（九）为止，realm 只能「被框架拉」：装配时读四件套、按 `context_every` 节奏被问
+`context_items()`、用 `ctx.inject()` 往下一个安全点排一条 Context。宿主 UI 想实时知道
+"用户刚改了一条待办"，只能等 50 回合的周期上下文，或者干脆等 `done`。
+
+这次给 realm 两个**写**出口 + 一圈**只看不改**的观测面（需求原文：
+「给予 realm 推送事件等更多能力」「还需要一些更加丰富的，onion 类型的 hook」
+「realm 不允许改写模型请求」「只读为什么要 `nxt()`，去掉」）：
+
+| 入口 | 语义 | 没有宿主时 |
+|---|---|---|
+| `ctx.emit(name, data=None)` | 往事件流推一帧**非终态** `realm`；不开回合、不落 checkpoint、不回放 | 静默 no-op（广播没人听） |
+| `ctx.push(text, *, bucket="environment", flags=None)` | 复用 `Agent.push`，自动 id `realm:<id>:<n>`；默认 `environment` 永不开回合，显式 `major` 才开 | `RealmError` |
+| `ctx.interrupt(reason="realm") -> bool` | 同步叫停当前回合，事件流以 `interrupted(reason="realm")` 收尾 | `RealmError` |
+| `ctx.turn` | 当前 `TurnInfo` 或 `None` | `None` |
+
+六个只读钩子（`BaseRealm` 上的 `async` 空实现，`overrides_hook()` 发现覆盖）：
+`on_turn_start(turn)` / `on_turn_end(turn, TurnOutcome)` / `on_model_start(ModelCall)` /
+`on_model_end(ModelCall, HookOutcome)` / `on_tool_start(ToolCall)` / `on_tool_end(ToolCall, HookOutcome)`。
+进入按声明序、退出**反序**（`on_turn_end` 同样反序）；`on_turn_end` 在**终态帧之前**跑，
+取消路径（`interrupt` / `close`）跳过它；钩子抛异常只记日志，**不改变回合**。
+
+**为什么钩子没有 `nxt()`**：realm 永久不能改写模型请求/响应。这不是约定而是机制 ——
+`ModelCall.messages` 是不可变 `tuple`、`ToolCall.args` 是 `MappingProxyType`，拿不到
+`ModelRequest`、没有返回值通道、没有短路/拒绝工具的入口。原型实测过四种 `awrap_model_call`
+改法（尾部追加 Human、脱敏最后一条、追加 system、删历史 ToolMessage）：模型都收到了新内容，
+但 **checkpoint 里仍是原文**，历史与事实分叉；拆工具组还会被 `tool_repair` 补占位变成
+"结果缺失"让模型自己猜。要影响未来就走正道：`ctx.inject()` / `ctx.push()` / 工具里 `apply()` /
+宿主 `reset_dialog()`；要真改请求是宿主自己的 `Realm.middleware()`（只能挂外层）。
+
+**已知时序**：`realm` 帧只保证**非终态 + 在终态帧之前**；它与 `tool_start` / `tool_result`
+的相对顺序**不保证** —— `ctx.emit` 直连 `hub.put_nowait`，工具帧来自事件翻译器，两条独立
+投递路径。手测里工具内 emit 的 `todo.changed` 排在 `tool_start` **之前**。宿主不要用帧顺序
+推断业务落库，事件自带的 `counts` / `ids` 才是事实。
+
+**实现**：`core` 的 `AGENT_EVENT_TYPES` 尾部追加 `"realm"`（13 → 14）+ `ev_realm()`；
+`realm_base` 的 `RealmHost` Protocol + `RealmContext` 四个成员 + 四个数据类 + 六个空钩子；
+`agent/realm/host.py::RealmHostPort`（emit → `hub.publish`、push → `Agent.push`、
+interrupt → `worker.interrupt`、turn → `worker.current_turn_info`）；
+`agent/realm/hooks.py::RealmHooksMiddleware`（每 realm 一个适配中间件，`name` 唯一）；
+`worker.py` 在 `start` 帧后 fire `on_turn_start`、终态帧前 fire `on_turn_end`，整段包在
+`current_turn(turn_id)` 里；`RealmManager(host_factory=...)` 注入 host；
+`build_chain(realm_middlewares=...)` 只给覆写了模型/工具钩子的 realm 追加适配器。
+`todo_realm` 每次改动后推 `todo.changed`（`counts` + `ids`），驱动宿主 UI 实时刷新。
+
+| 证据 | 说明 |
+|---|---|
+| `packages/liorium-core/tests/test_types.py`（改 2） | 金样 13 → 14（`"realm"` 在尾部）；`test_ev_realm_shape` |
+| `tests/test_event_contract.py`（改 1） | 冻结集合追加 `"realm"` |
+| `packages/liorium-agent/tests/test_realm_capabilities.py`（新增 14） | 回合内 emit 带 `turn_id` 且在 `done` 之前；空闲 emit 无 `turn_id`、无 `start`；无宿主时 emit 静默 / push 与 interrupt 抛 `RealmError`；push `environment` 不开回合（下一回合 `start.inputs` 带上自动 id）；push `major` 开新回合；非法 bucket 抛错；工具里 `ctx.interrupt()` ⇒ `interrupted(reason="realm")`；`ctx.turn` 回合内/外；两 realm 钩子顺序（进入 A→B、退出 B→A）；工具失败 `on_tool_end(ok=False)`；钩子抛异常非致命（回合仍 `done`）；只读快照（`tuple` / `MappingProxyType`，改则 `TypeError`）；未覆写钩子的 realm 不装中间件；`on_turn_end` 的 `realm` 帧排在 `done` 前 |
+| `packages/liorium-todo-realm/tests/test_todo_realm.py`（+1） | 每次 add/update/remove 都发一帧 `todo.changed`，字段与 `counts()` 一致 |
+| `packages/liorium-agent/tests/test_realm_base.py` / `test_realm_context.py` | 未改一行，仍全绿（新增成员全是可选路径） |
+
+文档：`event-stream.md`（§6 `ids` 说明、§7 → 14 种 + `realm` 行、边界段落、测试表）、
+`API.md`（事件表 + `ev_realm` + `RealmContext` 成员 + 六个钩子 + `RealmHost`）、
+`EXTENDING.md` §1.5、`GUIDE.md`、`ARCHITECTURE.md` §2/§3/§4.4、`INTERFACES.md`、
+`README.md`、`scheduler.md`、`docs/README.md`、`packages/liorium-agent/README.md`，
+以及 `__dev__/Liorium Event 事件流原生 定稿.md` §7 的「2026-11-14 修订（三）」。
+
+全量：`.\.venv\Scripts\python.exe -m pytest -q -m "not live"` → **1356 passed, 3 skipped,
+3 deselected**（变更（九）基线 1339 → +17）。
+
+## 2026-11-14 变更（十一）：宿主 → realm 消息（`send_to_realm` / `on_message`）
+
+变更（十）解决的是「realm → 宿主」。这一条补反向：外部主程序（GUI / webhook / cron）把一条
+**业务命令或领域事件**直接交给某个 realm，不经过模型、不等回合，立刻拿结果。需求原文：
+*"外部主程序通过公共API向Realm发送消息"*。
+
+```python
+reply = await agent.send_to_realm("todo", "todo.add", {"text": "写 demo"})
+# → "已添加 t1 [pending] 写 demo"
+```
+
+| 面 | 形状 |
+|---|---|
+| `RealmMessage`（`liorium.realm_base`） | `realm_id` / `name` / `data`（**副本**）/ `origin`；冻结 dataclass，空 `name` 抛 `RealmError` |
+| `BaseRealm.on_message(message)` | 落点；可 sync 可 async；返回值原样回给宿主；**默认实现抛 `RealmError`**（= 不接受消息，不静默丢） |
+| `LioriumAgent.send_to_realm(...)` | 唯一宿主入口：`realm_id, name, data=None, *, origin="host", timeout=None` |
+| `RealmManager.send(...)` | 实现层：状态检查 → `record.send_lock` → `CURRENT_REALM_MESSAGE` → `on_message()` |
+
+**语义**：立即执行（在调用方 task 里，与回合并发；不进维护队列）、等返回值、同 realm 串行
+（`RealmRecord.send_lock`，`start`/`stop` 共用同一把锁 ⇒ 停用会等在手消息；树级 record 就是根的
+那条 ⇒ 全树共用）、状态不对就抛（未装配 `RealmNotFoundError`；停用/失败 `RealmError`；
+agent 未 start / 已 close `TurnError`；handler 异常**原样上抛**；`timeout` 到期 `RealmError`）、
+树级 realm 的消息由根实例处理（`ctx.emit`/`ctx.push` 也作用在根 Agent）、**不进事件流**（想留痕
+就在 handler 里 `ctx.emit`）、完全不影响模型请求。
+
+**防互锁**：handler 执行期间 `CURRENT_REALM_MESSAGE` 有值，`_assert_maintenance_allowed()` 与
+`close()` 直接抛 `TurnError` —— 否则 handler 持着 realm 锁去等维护队列，维护队列又等这把锁。
+同 realm 递归 `send_to_realm` 仍会自锁（文档禁止）。
+
+**示例实现**：`TodoRealm.on_message` 认 `todo.add` / `todo.update` / `todo.remove` /
+`todo.list`（按名字最后一段分发，复用既有方法；未知名字抛 `RealmError`）。
+
+| 证据 | 说明 |
+|---|---|
+| `packages/liorium-realm-base/tests/test_realm_base.py`（+4） | `RealmMessage` 冻结 + `data` 副本 + `name` 去空白；空 `name` 抛错；默认 `on_message` 抛"不接受消息"；子类实现后返回值 |
+| `packages/liorium-agent/tests/test_realm_messages.py`（新增 17） | 返回值（async / sync）；字段与 `data` 副本；空 name；未装配 `RealmNotFoundError`；无 handler / 停用 / 失败 `RealmError`；未 start / 已 close `TurnError`；并发三条串行（`max_active == 1`）；**回合进行中发送立即返回**（工具卡着、无新 `start`、`done` 仍恰好一条）；`stop` 等在手消息；handler 异常原样上抛；`timeout` ⇒ `RealmError`；handler 里调维护操作 ⇒ `TurnError`；handler 里 `ctx.emit` ⇒ 事件流出现 `realm` 帧（`turn_id is None`）；树级 realm 命中根实例、agent 级 realm 命中子 Agent 自己的实例 |
+| `packages/liorium-todo-realm/tests/test_todo_realm.py`（+3） | `todo.add/update/remove` 经 `on_message` 各发一帧 `todo.changed` 且返回与工具一致的文本；`todo.list` 与未知名字；业务错误仍是 `错误：…` 文本（与工具一致） |
+| `packages/liorium-agent/tests/{test_realm_scope,test_realm_toggle,test_realm_manager,test_worker}.py` | 未改一行仍全绿（`start`/`stop` 加锁不改变原有语义） |
+
+文档：`API.md`（`send_to_realm` 成员行、`RealmMessage` + `on_message` 小节、`RealmManager.send`、
+§10.2）、`EXTENDING.md` §1.6（示例 + 规则 + 选型表）、`ARCHITECTURE.md` §4.5 + 模块地图、
+`INTERFACES.md`（第七拍契约追加）、`GUIDE.md`、`docs/README.md`（索引 + 术语表）、
+根 `README.md`、`packages/{liorium-agent,liorium-realm-base,liorium-todo-realm}/README.md`，
+以及 `__dev__/Liorium Realm 接收宿主消息 实施计划.md`。
+
+全量：`.\.venv\Scripts\python.exe -m pytest -q -m "not live"` → **1380 passed, 3 skipped,
+3 deselected**（变更（十）基线 1356 → +24）。
+
+---
+
+## 2026-11-14 变更（十二）：Agent Profile（第 13 个包 + realm 自组装）
+
+计划：[`docs/plans/2026-11-14-agent-profile.md`](../plans/2026-11-14-agent-profile.md)（唯一依据）。
+这一条把"Agent 怎么装配"从命令行 flag / `config.json` 搬进一份可分享的 `profile.json`，
+并顺手把两个生命周期问题收干净：realm 的配置由 realm 自己声明（`Config`），模型由造它的人关
+（`ChatModelPool`）。
+
+### 交付面
+
+| # | 交付项 | 状态 | 证据 |
+|---|---|---|---|
+| 1 | `RealmSpec.config` + `RealmContext.config` / `ctx.model`；`AgentSpec` 删 `Profile` / `with_profile` | ✅ | `packages/liorium-agent/tests/test_ctx_model.py`（4：独立 ctx 无 aux 模型 / 每次访问都新建 / manager 注入 config+工厂 / Agent 用 compact 工厂且 apply 后刷新）、`test_model_close.py`（4：共享工厂只关一次 / 不同工厂各关一次 / 裸函数工厂也能关 / `aclose` 异常不阻塞 `close()`）；旧 `test_profile.py` 删除 |
+| 2 | `ChatModelPool`（`(label, intensity, purpose)` 缓存、`chat`/`compact` 绑定视图、幂等 `aclose`） | ✅ | `packages/liorium-provider-manager/tests/test_pool.py`（7：purpose/intensity、缓存键、api_format、缺 key、幂等 aclose、关闭失败只记日志） |
+| 3 | `MemoryRealm.Config = MemoryConfig` 自组装（embed / vectors / extraction / `ctx.model`） | ✅ | `packages/liorium-memory/tests/test_memory_config.py`（7：默认值、`dir` 布局、embed 构建与关闭、缺 `[vector]` 降级、抽取器用 `ctx.model`、无对象时关闭抽取、`dir` 与 `db_path` 冲突） |
+| 4 | 新包 `liorium-profile`：`AgentProfile.load/from_dict/build`、`ProfileBuild` | ✅ | `packages/liorium-profile/tests/`（35：schema / loader（`${VAR}`、`~`、`$$`、source 四种写法、mtime 缓存、`sys.path` 不被污染、Config 校验）/ build（spec 逐项、指纹、registry 覆盖、禁覆盖端口）/ lifecycle（pool 关闭恰好一次、`create_agent` TypeError）） |
+| 5 | CLI：profile 取代 `config.json` 装配；旧配置一次性迁移（`.bak`）；`setup profile` 子命令 | ✅ | `packages/liorium-cli/tests/test_cli_profile.py`（6：模板 / 路径优先级 / 迁移映射 / UI-only / realm 读写）、`test_cli_setup.py`（35：`setup profile show|path|init|validate|edit|migrate`、自动迁移、冷启动）、`test_cli_agent.py`（36：profile 驱动装配、flag 只覆盖本次、`/reload` 与身份变化报错、`/model`、`/thinking`、realm 缺失提示） |
+| 6 | 发布形态：13 个模块 | ✅ | `tests/test_distribution.py`（13）、`tests/test_architecture.py`（依赖白名单 + 发现集合）、`scripts/check_wheel.py`（13） |
+| 7 | 文档同步 | ✅ | `ARCHITECTURE.md`（模块地图 + §4.0 realm 自组装）、`API.md`（§4.1 `RealmSpec.config`、§4.6 `ctx.config`/`ctx.model`、§9.5 `ChatModelPool`、§12 `liorium.profile`）、`EXTENDING.md` §1.7、`MEMORY.md` §8 / §A、`GUIDE.md`、`API.md`/`README.md` 的 12→13、各包 README |
+
+### 验收用例对照（计划 §8）
+
+- schema / loader：`version` 非 1、未知字段、realm id 重复、四种 `source`、`Config` 校验、
+  `${VAR}` 未定义、`$$` 转义、内置 `subagents` 可省 source、`requires` 越界、`id` 缺省取文件名
+  —— `test_profile_schema.py` / `test_profile_loader.py` / `test_profile_sources.py`；
+- build / 生命周期：spec 逐项等价、指纹稳定、`model` 优先级、`context_window: 0` 不被覆盖、
+  `create_agent` 禁覆盖、迁移得到的 profile 能直接 `load()`+`build()` —— `test_profile_build.py`、
+  `test_cli_setup.py::test_run_cli_migrates_old_config`；
+- CLI：无配置启动生成 `~/.liorium/profile.json` + UI-only `config.json`、旧配置迁移、
+  `--profile` > cwd > home、flag 不回写 profile、`/reload` 改 realms 生效、改 `id`/`inbox` 要求重启
+  —— `test_cli_setup.py`、`test_cli_agent.py`、`test_cli_profile.py`；
+- 架构与发布：`test_architecture.py`、`test_distribution.py`、`scripts/check_wheel.py`。
+
+### 全量
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
+# 1441 passed, 3 skipped, 3 deselected
+```
+
+（变更（十一）基线 1380 → +61：新增 57 —— `liorium-profile` 35、`ChatModelPool` 7、
+`MemoryConfig` 7、agent `ctx.model` / 工厂关闭 8；CLI 侧净增 13（`setup profile` 5、
+自动建 profile / 坏 profile / 迁移 3，其余为改写后的等价用例）；同时删除旧的
+`packages/liorium-agent/tests/test_profile.py`（9）与只测旧 flag 的用例。）
+
+### 已知取舍（计划 §9）
+
+明文 key 可以写进 profile（0600 + `${VAR}`；轮换 key 会因指纹变化重建 realm）、`load()` 会执行
+本地代码（`--schema-only` 提供"只查结构"模式）、`ctx.model` 的花费不设上限、embedding 凭据
+需要在 profile 里重复写一次（realm 看不到 provider registry）。

@@ -146,10 +146,34 @@ async def main() -> None:
 | `liorium.provider.schema` | `ModelProvider`、`ModelProviders`、`loads`、`dumps`、`parse_spec`、CRUD、选择辅助 |
 | `liorium.provider.registry` | `ProviderRegistry`、`ResolvedModel` |
 | `liorium.provider.formats` | `API_FORMATS`、`resolve_route`、`build_chat_model`、`build_chat_model_from_spec`、`describe_*`、`close_chat_model` |
+| `liorium.provider.pool` | `ChatModelPool`（按 `(label, intensity, purpose)` 懒建 + 幂等关闭）、`ModelFactoryPort` |
 | `liorium.provider.thinking` | `THINKING_PRESETS`、`get_format_thinking_params`、`ReasoningChatOpenAI`、`resolve_thinking_dialect` |
 | `liorium.provider.thinking_caps` | `ThinkingCapability`、`ThinkingOption`、`resolve_thinking_capability`、`describe_thinking` |
 | `liorium.provider.catalog` | `ensure_catalog`、`refresh_catalog`、`catalog_status`、`match_provider`、`enrich_provider` |
 | `liorium.provider.discovery` | `fetch_provider_model_entries`、`auto_load_model_for_provider` |
+
+## 模型池（`ChatModelPool`，2026-11-14）
+
+模型能不能关，只有造它的层知道（`close_chat_model` 只关私有 HTTP 客户端；langchain 默认客户端
+在模块级 `lru_cache` 里，关掉会让同 `base_url` 的模型永久不可用）。所以库提供一个池：
+
+```python
+from liorium.provider import ChatModelPool
+
+pool = ChatModelPool(registry, thinking="medium", temperature=0.3)
+agent = LioriumAgent(
+    spec=spec,
+    model_factory=pool.chat,              # 主对话：带思考强度
+    compact_model_factory=pool.compact,   # aux / 摘要：强制不思考
+)
+...
+await agent.close()   # 已调两个工厂的 aclose()（幂等）
+await pool.aclose()   # 兜底，重复调用安全
+```
+
+- 缓存键 `(label, intensity, purpose)`：`/thinking` 改 `pool.thinking` 后下一次 `chat` 建新模型，
+  旧模型仍由一次 `aclose` 关干净；
+- `aclose()` 幂等；关完再用抛 `RuntimeError`（不静默返回坏模型）。
 
 ## 设计取舍
 

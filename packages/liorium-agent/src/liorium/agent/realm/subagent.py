@@ -37,12 +37,12 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Mapping
 
 from langchain_core.tools import tool
 
-from liorium.core.errors import TurnError, TurnInterrupted
 from liorium.core.log import get_logger
 from liorium.core.types import ContextItem, Text
 from liorium.vfs.fs import VirtualFileSystem
 from liorium.vfs.node import VfsMount, VfsNode
 
+from ..runtime.inbox import Bucket
 from .base import BaseRealm, RealmContext, TurnInfo
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -167,10 +167,11 @@ class SubagentRealm(BaseRealm):
     context_every = 1
     """每回合都给一次注入机会：有子代理转场就提醒，没有就返回空（不消费周期）。"""
 
-    def __init__(self, *, parent: "LioriumAgent", params: dict[str, Any] | None = None) -> None:
+    def __init__(self, *, parent: "LioriumAgent", config: dict[str, Any] | None = None) -> None:
         super().__init__()  # 提供 self.ctx / self.log（start() 之前也能安全读）
         self.parent = parent
-        self.params = dict(params or {})
+        self.config = dict(config or {})
+        self.params = self.config  # 旧名别名
         self.children: dict[str, ChildRecord] = {}
         self._vfs = VirtualFileSystem(owner_id=f"{parent.spec.id}:subagents")
         self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
@@ -685,7 +686,6 @@ class SubagentRealm(BaseRealm):
             artifacts=self.parent.artifacts,
             root_agent=self.parent,
             api_format=self.parent.api_format,
-            priority=self.parent.priority - 1,
             system_prompt_override=record.system_prompt or None,
             tool_names=record.toolsets,
         )
@@ -742,20 +742,59 @@ class SubagentRealm(BaseRealm):
 
     async def _run_child(self, record: ChildRecord, message: str) -> None:
         agent_id = record.agent_id
+        # 每个子代理同一时刻只有一个回合，所以这个 id 稳定且唯一；它也是事件流的
+        # 关联键（``push`` 没有返回值）。
+        entry_id = f"{agent_id}:turn"
         try:
             agent = await self._ensure_agent(record)
-            async for event in agent.run(message, origin="subagent"):
-                payload = event.to_dict()
-                if event.type in ("delta", "reasoning_delta"):
-                    record.output += str(event.get("content") or "")
-                self._publish(
-                    {"type": payload.pop("type"), "agent_id": agent_id, **payload}
+            subscription = agent.stream(ids=[entry_id])
+            iterator = subscription.__aiter__()
+            try:
+                # 先订阅再 push（订阅发生在 __aiter__），否则会漏掉首帧。
+                agent.push(
+                    message,
+                    id=entry_id,
+                    bucket=Bucket.MAJOR,
+                    origin="subagent",
                 )
-            record.status = "done"
-        except TurnInterrupted:
-            record.status = "stopped"
-            self._publish({"type": "stopped", "agent_id": agent_id, "name": record.name})
-        except (TurnError, Exception) as exc:  # noqa: BLE001 - 子代理失败不拖垮父
+                while True:
+                    try:
+                        event = await iterator.__anext__()
+                    except StopAsyncIteration:
+                        # Agent 已 close（hub 关闭）：旧 run() 的"迭代结束"语义。
+                        if record.status == "running":
+                            record.status = "done"
+                        break
+                    if event.type == "input":
+                        # 入站生命周期帧不属于子代理对外的帧集合（旧 run() 也不发）。
+                        continue
+                    if event.type in ("delta", "reasoning_delta"):
+                        record.output += str(event.get("content") or "")
+                    if event.type == "done":
+                        record.status = "done"
+                    elif event.type == "interrupted":
+                        record.status = "stopped"
+                        self._publish(
+                            {"type": "stopped", "agent_id": agent_id, "name": record.name}
+                        )
+                        break
+                    elif event.type == "error":
+                        record.status = "error"
+                        record.error = str(event.get("error") or "未知错误")
+                        log.error("子代理失败: %s: %s", record.name, record.error)
+                        self._publish(
+                            {"type": "error", "agent_id": agent_id, "message": record.error}
+                        )
+                        break
+                    payload = event.to_dict()
+                    self._publish(
+                        {"type": payload.pop("type"), "agent_id": agent_id, **payload}
+                    )
+                    if event.type == "done":
+                        break
+            finally:
+                await subscription.aclose()
+        except Exception as exc:  # noqa: BLE001 - 子代理失败不拖垮父
             record.status = "error"
             record.error = f"{type(exc).__name__}: {exc}"
             log.error("子代理失败: %s: %s", record.name, exc, exc_info=exc)

@@ -13,19 +13,43 @@ from typing import Any
 
 import pytest
 
-from liorium.realm_base import JsonStateStore, RealmContext, TurnInfo
+from liorium.core.errors import RealmError
+from liorium.realm_base import JsonStateStore, RealmContext, RealmMessage, TurnInfo
 from liorium.todo_realm import STATES, TodoRealm, render_context
 
 
+class _RecordingHost:
+    """只收 ``emit`` 的假宿主端口（2026-11-14 的 ``ctx.emit``）。"""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, dict[str, Any]]] = []
+
+    def emit(self, name: str, data: dict[str, Any]) -> None:
+        self.events.append((name, data))
+
+    def push(self, text: str, *, bucket: str = "environment", origin: str = "", timeout=None) -> str:
+        raise AssertionError("todo realm 不该 push")
+
+    def interrupt(self, reason: str = "realm") -> bool:
+        raise AssertionError("todo realm 不该 interrupt")
+
+    def turn_info(self):
+        return None
+
+
 async def started(
-    tmp_path: Path, *, params: dict[str, Any] | None = None
+    tmp_path: Path,
+    *,
+    params: dict[str, Any] | None = None,
+    host: Any = None,
 ) -> tuple[TodoRealm, RealmContext]:
     realm = TodoRealm(SimpleNamespace(params=dict(params or {})))
     ctx = RealmContext(
         realm_id="todo",
         vfs=None,  # type: ignore[arg-type] - 本 realm 没有挂载，不需要真 VFS
         state=JsonStateStore(tmp_path / "realm_state" / "todo.json", realm_id="todo"),
-        params=dict(params or {}),
+        config=dict(params or {}),
+        host=host,
     )
     # 与 RealmManager.start() 一致：先 load 再 start
     ctx.state.load()
@@ -63,6 +87,26 @@ async def test_add_assigns_incrementing_ids_and_persists(tmp_path: Path) -> None
     assert [item["text"] for item in payload["items"]] == ["写周报", "回邮件"]
     assert payload["next_id"] == 3
     assert [item.id for item in realm.todos()] == ["t1", "t2"]
+
+
+async def test_every_mutation_emits_todo_changed(tmp_path: Path) -> None:
+    """2026-11-14：增删改都广播 ``todo.changed``（宿主 UI 不用等 50 回合）。"""
+    host = _RecordingHost()
+    realm, _ctx = await started(tmp_path, host=host)
+    todo = tools(realm)["todo"]
+
+    await todo.ainvoke({"action": "add", "text": "写周报"})
+    await todo.ainvoke({"action": "update", "id": "t1", "status": "finished"})
+    await todo.ainvoke({"action": "remove", "id": "t1"})
+
+    assert [name for name, _ in host.events] == ["todo.changed"] * 3
+    added = host.events[0][1]
+    assert added["ids"] == ["t1"]
+    assert added["counts"]["pending"] == 1
+    updated = host.events[1][1]
+    assert updated["counts"]["finished"] == 1
+    removed = host.events[2][1]
+    assert removed["ids"] == [] and sum(removed["counts"].values()) == 0
 
 
 async def test_update_text_and_status(tmp_path: Path) -> None:
@@ -229,6 +273,54 @@ async def test_context_rendering_is_stable(tmp_path: Path) -> None:
     item = realm.context_items(TurnInfo(index=1, id="agent#1"))
     assert item is not None
     assert item.text == render_context(realm.todos(include_finished=True))
+
+
+# ---------------------------------------------------------------------------
+# 宿主消息（2026-11-14）：on_message
+# ---------------------------------------------------------------------------
+
+
+async def test_on_message_routes_add_update_remove(tmp_path: Path) -> None:
+    host = _RecordingHost()
+    realm, _ctx = await started(tmp_path, host=host)
+
+    assert (
+        await realm.on_message(RealmMessage(realm_id="todo", name="todo.add", data={"text": "写 demo"}))
+        == "已添加 t1 [pending] 写 demo"
+    )
+    assert (
+        await realm.on_message(
+            RealmMessage(realm_id="todo", name="todo.update", data={"id": "t1", "status": "processing"})
+        )
+        == "已更新 t1 [processing] 写 demo"
+    )
+    assert (
+        await realm.on_message(RealmMessage(realm_id="todo", name="todo.remove", data={"id": "t1"}))
+        == "已删除 t1：写 demo"
+    )
+
+    # 每次改动都推 todo.changed；落盘同步
+    assert [name for name, _ in host.events] == ["todo.changed"] * 3
+    saved = json.loads(state_file(tmp_path).read_text(encoding="utf-8"))
+    assert saved["items"] == []
+
+
+async def test_on_message_list_and_unknown_name(tmp_path: Path) -> None:
+    realm, _ctx = await started(tmp_path)
+    await realm.on_message(RealmMessage(realm_id="todo", name="todo.add", data={"text": "甲"}))
+
+    assert "甲" in await realm.on_message(RealmMessage(realm_id="todo", name="todo.list"))
+    with pytest.raises(RealmError, match="不认识消息"):
+        await realm.on_message(RealmMessage(realm_id="todo", name="todo.explode"))
+
+
+async def test_on_message_reports_errors_as_text(tmp_path: Path) -> None:
+    realm, _ctx = await started(tmp_path)
+    # 业务错误沿既有约定返回 "错误：…"，不抛（与工具一致）
+    assert (
+        await realm.on_message(RealmMessage(realm_id="todo", name="todo.add", data={"text": ""}))
+        == "错误：add 需要非空 text"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@
 
 工具子集的来源（先到先得）：
 
-1. ``RealmSpec.params["tools"]``（显式配置，可序列化，进指纹）；
+1. ``RealmSpec.config["tools"]``（显式配置，可序列化，进指纹）；
 2. ``RealmContext.agent_spec.toolsets["default"]``（``AgentSpec`` 未改动时的既有语义）；
 3. 都没有 ⇒ 六个全给。
 
@@ -101,9 +101,9 @@ class CoreToolRealm(BaseRealm):
 
     def _resolve_names(self) -> tuple[str, ...] | None:
         """``None`` = 六个全给；否则是显式子集（保持给出顺序、去重）。"""
-        raw = self.params.get("tools")
+        raw = self.config.get("tools")
         if raw is not None:
-            return _parse_names(raw, source="RealmSpec.params['tools']")
+            return _parse_names(raw, source="RealmSpec.config['tools']")
         spec = getattr(self.ctx, "agent_spec", None) if self.ctx is not None else None
         toolsets = getattr(spec, "toolsets", None) or {}
         if "default" in toolsets:
@@ -147,7 +147,7 @@ class CoreToolRealm(BaseRealm):
         return store
 
     def _max_output_chars(self) -> int:
-        raw = self.params.get("max_tool_output_chars", DEFAULT_MAX_OUTPUT_CHARS)
+        raw = self.config.get("max_tool_output_chars", DEFAULT_MAX_OUTPUT_CHARS)
         if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
             raise RealmError(
                 f"core realm 的 max_tool_output_chars 非法: {raw!r}（需要 >= 0 的整数）"

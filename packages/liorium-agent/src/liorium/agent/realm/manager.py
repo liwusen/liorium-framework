@@ -11,8 +11,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import re
+from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
@@ -25,6 +27,7 @@ from liorium.core.errors import (
 )
 from liorium.core.log import get_logger
 from liorium.core.types import ContextItem, Event
+from liorium.realm_base import RealmMessage, overrides_hook
 from liorium.vfs.fs import VirtualFileSystem
 from liorium.vfs.node import VfsMount
 
@@ -35,6 +38,17 @@ if TYPE_CHECKING:  # pragma: no cover - 仅类型
 
 RealmFactory = Callable[[Any], Realm]
 """``RealmSpec -> Realm 实例``。"""
+
+CURRENT_REALM_MESSAGE: ContextVar[RealmMessage | None] = ContextVar(
+    "liorium_realm_message", default=None
+)
+"""正在处理的宿主消息（2026-11-14）。
+
+``RealmManager.send()`` 在调用 ``on_message()`` 期间设置。用途只有一个：**防互锁** ——
+handler 里调 ``refresh_realms`` / ``set_realm_enabled`` / ``reset_dialog`` / ``close``
+会去等维护队列，而维护队列又要等这条消息放掉 realm 锁，必然死锁；所以这些入口看到
+这个 ContextVar 就抛 ``TurnError``。
+"""
 
 _UNSAFE_ID = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -76,6 +90,7 @@ class RealmManager:
         agent_spec: Any = None,
         workspace_root: Path | None = None,
         artifacts: Any = None,
+        host_factory: Callable[[str], Any] | None = None,
     ) -> None:
         self.agent_id = agent_id
         self.vfs = vfs
@@ -95,6 +110,13 @@ class RealmManager:
         self._borrowed: set[str] = set()
         """本 manager 借用（而不是自己启动）的 realm id。"""
         self._on_turn_event = on_turn_event
+        self._host_factory = host_factory
+        """``realm_id -> RealmHost``：realm 主动推送的端口（``ctx.emit/push/interrupt/turn``）。
+
+        独立使用 ``RealmManager``（测试）时为 ``None``，``ctx.host`` 就是 ``None``。
+        """
+        self._aux_model_factory: Callable[[], Any] | None = None
+        """零参 aux 模型工厂（``ctx.model`` 用）；由 :meth:`configure` 注入。"""
         self.log = get_logger(f"realm.manager.{agent_id}")
 
     def configure(
@@ -103,15 +125,25 @@ class RealmManager:
         agent_spec: Any = None,
         workspace_root: Path | None = None,
         artifacts: Any = None,
+        aux_model_factory: Callable[[], Any] | None = None,
     ) -> None:
-        """绑定运行期上下文（Agent 在 ``start()`` / ``apply()`` 时调用）。
+        """绑定运行期上下文（Agent 在构造 / ``start()`` / ``apply()`` 时调用）。
 
         ``RealmContext`` 里这几个字段不是序列化配置（它们随实例走），所以不进
-        ``RealmSpec.params``：params 参与指纹，绝对路径会污染它。
+        ``RealmSpec.config``：config 参与指纹，绝对路径会污染它。
+
+        ``aux_model_factory`` 是零参工厂：realm 通过 ``ctx.model`` 每次取**当前** aux
+        模型（``apply()`` 换模型后不会拿到过期实例）。
         """
         self._agent_spec = agent_spec
         self._workspace_root = Path(workspace_root) if workspace_root is not None else None
         self._artifacts = artifacts
+        self._aux_model_factory = aux_model_factory
+
+    def _current_aux(self) -> Any:
+        """``ctx.model`` 的入口：每次访问都读**当前**工厂（``apply()`` 后可换）。"""
+        factory = self._aux_model_factory
+        return factory() if factory is not None else None
 
 
     # ------------------------------------------------------------------
@@ -159,7 +191,7 @@ class RealmManager:
         self._order = self._toposort(records)
         self._records = records
         self._borrowed = borrowed
-        # 装配即登记 spec，保证 ctx.params 不依赖调用方是否先 attach_specs()
+        # 装配即登记 spec，保证 ctx.config 不依赖调用方是否先 attach_specs()
         self.attach_specs(spec_list)
 
     def _shared_records(self) -> dict[str, RealmRecord]:
@@ -176,14 +208,14 @@ class RealmManager:
         """子 Agent 的 realm 参数对树级实例无效：不一致就说出来，别让配置假装生效。"""
         if self._parent is None:  # pragma: no cover - 没有父就没有借用
             return
-        owner_params = self._parent._spec_params(spec.id)  # noqa: SLF001
-        if dict(spec.params) != owner_params:
+        owner_params = self._parent._spec_config(spec.id)  # noqa: SLF001
+        if dict(spec.config) != owner_params:
             self.log.warning(
-                "realm %s 是树级共享实例（instance_scope=\"tree\"）：子 Agent 的 params 被忽略"
+                "realm %s 是树级共享实例（instance_scope=\"tree\"）：子 Agent 的 config 被忽略"
                 "（生效的是根 Agent 的 %r，收到 %r）",
                 spec.id,
                 owner_params,
-                dict(spec.params),
+                dict(spec.config),
             )
 
 
@@ -230,6 +262,12 @@ class RealmManager:
         record = self._record(realm_id)
         if realm_id in self._borrowed:
             return
+        # 与宿主消息互斥（2026-11-14）：send 持同一把锁 ⇒ 启动不会撞上处理中的消息
+        async with record.send_lock:
+            await self._start_locked(record)
+
+    async def _start_locked(self, record: RealmRecord) -> None:
+        realm_id = record.spec_id
         if record.state == "running":
             return
         instance = record.instance
@@ -239,7 +277,8 @@ class RealmManager:
                 realm_id=realm_id,
                 vfs=self.vfs,
                 state=JsonStateStore(self._state_path(realm_id, instance), realm_id=realm_id),
-                params=dict(self._spec_params(realm_id)),
+                config=dict(self._spec_config(realm_id)),
+                model_factory=self._current_aux,
                 agent_id=self.agent_id,
                 inbox_dir=self.state_dir.parent,
                 workspace_root=self._workspace_root,
@@ -248,6 +287,11 @@ class RealmManager:
                 conversation_id=self.conversation_id,
                 tasks=RealmTaskScope(log_name=f"realm.{realm_id}"),
                 context=self._context_channel,
+                host=(
+                    self._host_factory(realm_id)
+                    if self._host_factory is not None
+                    else None
+                ),
             )
             ctx.state.load()
             record.context = ctx
@@ -279,6 +323,12 @@ class RealmManager:
                 f"realm {realm_id!r} 是树级共享实例（instance_scope=\"tree\"）："
                 "只能由根 Agent 停止"
             )
+        # 与宿主消息互斥：先等手上那条消息处理完，再拆 ctx / 撤挂载
+        async with record.send_lock:
+            await self._stop_locked(record)
+
+    async def _stop_locked(self, record: RealmRecord) -> None:
+        realm_id = record.spec_id
         if record.state not in ("running", "failed"):
             return
         try:
@@ -335,8 +385,87 @@ class RealmManager:
         return True
 
     def context_cadence(self, realm_id: str) -> int:
-        """该 realm 的第五拍节奏（``0`` = 不注入；``RealmSpec.params`` 覆盖类属性）。"""
+        """该 realm 的第五拍节奏（``0`` = 不注入；``RealmSpec.config`` 覆盖类属性）。"""
         return self._cadence(self._record(realm_id))
+
+    # ------------------------------------------------------------------
+    # 宿主消息（2026-11-14）
+    # ------------------------------------------------------------------
+
+    async def send(
+        self,
+        realm_id: str,
+        message: RealmMessage,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        """把一条宿主消息交给运行中的 realm，等它处理完并返回 handler 的返回值。
+
+        **立即执行**（不进维护队列、不等当前回合结束）：``await`` 就进 ``on_message()``，
+        与正在跑的回合是并发的 —— handler 必须廉价，慢活自己 ``ctx.spawn``。
+
+        错误语义：未装配 ⇒ ``RealmNotFoundError``；状态不是 ``running``
+        （``stopped`` / ``starting`` / ``failed``）⇒ ``RealmError``（带状态与
+        ``record.error``）；没实现 ``on_message()`` ⇒ ``RealmError``；handler 抛的异常
+        **原样上抛**（同时记一条带 realm id 的 error 日志）；``timeout`` 到期 ⇒
+        ``RealmError``。
+
+        ``record.send_lock`` 与 ``start()`` / ``stop()`` 共用 ⇒ 同 realm 的消息彼此串行，
+        停用 / 重启会等手上这条消息跑完。树级 realm 的 record 是根 manager 的那条，
+        所以这把锁也是**全树共用**的。
+        """
+        if not isinstance(message, RealmMessage):
+            raise RealmError(f"realm {realm_id!r} 的 send() 需要 RealmMessage")
+        if message.realm_id != realm_id:
+            raise RealmError(
+                f"消息的 realm_id ({message.realm_id!r}) 与目标 ({realm_id!r}) 不一致"
+            )
+        record = self._record(realm_id)
+        handler = getattr(record.instance, "on_message", None)
+        if not callable(handler):
+            raise RealmError(
+                f"realm {realm_id!r} 不接受消息（没有实现 on_message）"
+            )
+        self._assert_running(record)
+        async with record.send_lock:
+            # 等锁期间可能被停用/重启，进 handler 前再确认一次
+            self._assert_running(record)
+            token = CURRENT_REALM_MESSAGE.set(message)
+            try:
+                result = handler(message)
+                if inspect.isawaitable(result):
+                    if timeout is None:
+                        result = await result
+                    else:
+                        try:
+                            result = await asyncio.wait_for(result, timeout)
+                        except TimeoutError as exc:
+                            raise RealmError(
+                                f"realm {realm_id!r} 处理消息 {message.name!r} 超时（{timeout}s）"
+                            ) from exc
+                return result
+            except Exception as exc:  # noqa: BLE001 - 原样上抛，先留一条带 realm 的日志
+                self.log.error(
+                    "realm 消息处理失败: %s %r: %s: %s",
+                    realm_id,
+                    message.name,
+                    type(exc).__name__,
+                    exc,
+                    exc_info=exc,
+                )
+                raise
+            finally:
+                CURRENT_REALM_MESSAGE.reset(token)
+
+    @staticmethod
+    def _assert_running(record: RealmRecord) -> None:
+        """消息只发给运行中的 realm；其它状态（含启动失败）一律报错，不静默丢。"""
+        if record.state == "running":
+            return
+        detail = f"（{record.error}）" if record.error else ""
+        raise RealmError(
+            f"realm {record.spec_id!r} 当前状态 {record.state!r}，不能接收消息{detail}"
+        )
 
     # ------------------------------------------------------------------
     # 运行期刷新（v1.1：realm 自报 dirty）
@@ -487,14 +616,14 @@ class RealmManager:
         return out
 
     def _option(self, record: RealmRecord, key: str, default: Any) -> Any:
-        """节奏参数：``RealmSpec.params`` 优先，其次实例的类属性。
+        """节奏参数：``RealmSpec.config`` 优先，其次实例的类属性。
 
         ``record.context`` 还没建（未 ``start()``）时从登记的 spec 读，保证
         ``context_cadence()`` 在启动前后给出同一个答案。
         """
         params = getattr(record.context, "params", None)
         if params is None:
-            params = self._spec_params(record.spec_id)
+            params = self._spec_config(record.spec_id)
         params = params or {}
         if key in params:
             return params[key]
@@ -600,8 +729,13 @@ class RealmManager:
                 out.append((rid, fragment))
         return out
 
-    def realm_middlewares(self) -> list[Any]:
-        """所有运行中 realm 追加的中间件（按声明序，位于基座外层；借用来的不计）。"""
+    def realm_middlewares(self, hook_factory: Callable[[str, Any], Any] | None = None) -> list[Any]:
+        """所有运行中 realm 追加的中间件（按声明序，位于基座外层；借用来的不计）。
+
+        ``hook_factory(realm_id, instance)`` 是 2026-11-14 加的钩子适配器工厂：返回值
+        插在**该 realm 自己的 middleware 之后**（同一 realm 内 middleware 更外层）。
+        工厂返回 ``None`` 表示该 realm 没覆盖钩子，不装适配器。
+        """
         out: list[Any] = []
         for rid in self._order:
             record = self._records[rid]
@@ -611,6 +745,25 @@ class RealmManager:
                 out.extend(record.instance.middleware() or [])
             except Exception as exc:  # noqa: BLE001
                 self.log.error("realm middleware 失败: %s: %s", rid, exc)
+            if hook_factory is not None:
+                try:
+                    hook_middleware = hook_factory(rid, record.instance)
+                except Exception as exc:  # noqa: BLE001
+                    self.log.error("realm hook 适配器装配失败: %s: %s", rid, exc)
+                    continue
+                if hook_middleware is not None:
+                    out.append(hook_middleware)
+        return out
+
+    def hook_instances(self, name: str) -> list[Any]:
+        """运行中的、覆盖了钩子 ``name`` 的 realm 实例（声明序；借用来的不计）。"""
+        out: list[Any] = []
+        for rid in self._order:
+            record = self._records[rid]
+            if record.state != "running" or rid in self._borrowed:
+                continue
+            if overrides_hook(record.instance, name):
+                out.append(record.instance)
         return out
 
     def _assert_mount_scope(self, realm_id: str, instance: Any) -> None:
@@ -714,7 +867,7 @@ class RealmManager:
             f"realm {realm_id!r} 的 state_scope 非法: {scope!r}（允许 agent / conversation）"
         )
 
-    def _spec_params(self, realm_id: str) -> dict[str, Any]:
+    def _spec_config(self, realm_id: str) -> dict[str, Any]:
         spec = getattr(self, "_specs", {}).get(realm_id)
         return dict(getattr(spec, "params", {}) or {})
 

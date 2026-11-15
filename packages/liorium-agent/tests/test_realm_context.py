@@ -18,7 +18,7 @@ import pytest
 
 from liorium.agent import AgentSpec, BaseRealm, Limits, RealmSpec, LioriumAgent
 from liorium.core.types import ContextItem
-from liorium_testkit import make_scripted_factory
+from liorium_testkit import collect_turn, make_scripted_factory
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +57,7 @@ def make_spec(workspace: Path, realms: Sequence[RealmSpec]) -> AgentSpec:
 
 async def run_turns(agent: LioriumAgent, count: int) -> None:
     for index in range(count):
-        events = [event async for event in agent.run(f"第{index + 1}回合")]
+        events = await collect_turn(agent, f"第{index + 1}回合")
         assert events[-1].type == "done"
 
 
@@ -141,7 +141,7 @@ async def test_params_override_class_attributes(agent_workspace: Path) -> None:
     realm.payloads = ["甲", "乙", "丙"]
     agent = LioriumAgent(
         spec=make_spec(
-            agent_workspace, [RealmSpec(id="cadence", params={"context_every": 2})]
+            agent_workspace, [RealmSpec(id="cadence", config={"context_every": 2})]
         ),
         model_factory=make_scripted_factory(["好"]),
         realm_factories={"cadence": lambda _spec: realm},
@@ -168,11 +168,11 @@ async def test_context_origins_filters_turns(agent_workspace: Path) -> None:
     )
     await agent.start()
     try:
-        events = [event async for event in agent.run("用户回合")]
+        events = await collect_turn(agent, "用户回合")
         assert events[-1].type == "done"
         assert realm.calls == []  # origin="user" 不匹配，连计时都不走
 
-        [event async for event in agent.run("触发回合", origin="trigger")]
+        await collect_turn(agent, "触发回合", origin="trigger")
         assert realm.calls == [2]
     finally:
         await agent.close()
@@ -417,7 +417,7 @@ async def test_illegal_cadence_is_treated_as_zero(
             return "不该被问"
 
     agent = LioriumAgent(
-        spec=make_spec(agent_workspace, [RealmSpec(id="odd", params={"context_every": bad})]),
+        spec=make_spec(agent_workspace, [RealmSpec(id="odd", config={"context_every": bad})]),
         model_factory=make_scripted_factory(["好"]),
         realm_factories={"odd": Odd},
     )

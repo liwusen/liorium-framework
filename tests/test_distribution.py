@@ -1,8 +1,8 @@
-"""发布形态守卫：一个发行版 ``liorium`` 必须真的包含 12 个模块。
+"""发布形态守卫：一个发行版 ``liorium`` 必须真的包含 13 个模块。
 
 源码按 ``packages/<包名>/src/liorium/<子包>`` 分目录维护（方便逐个约束依赖方向），
 但**只发布根项目** ``liorium``：根 ``pyproject.toml`` 用
-``[tool.hatch.build.targets.wheel].force-include`` 把 12 个模块树注入同一个 wheel。
+``[tool.hatch.build.targets.wheel].force-include`` 把 13 个模块树注入同一个 wheel。
 
 这套结构有两个静默失败模式，都靠本文件钉住：
 
@@ -90,7 +90,7 @@ def test_force_include_covers_every_module() -> None:
     ]
     assert not missing, "force-include 漏了这些模块（wheel 里会缺）：\n" + "\n".join(missing)
 
-    assert len(expected) == 12, f"预期 12 个模块，扫到 {len(expected)}：{sorted(expected)}"
+    assert len(expected) == 13, f"预期 13 个模块，扫到 {len(expected)}：{sorted(expected)}"
 
 
 def test_force_include_has_no_stale_entries() -> None:

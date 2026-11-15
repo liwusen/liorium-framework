@@ -28,7 +28,7 @@ agent = LioriumAgent(
         realms=[
             RealmSpec(
                 id="mcp",
-                params={
+                config={
                     "servers": {
                         "playwright": {
                             "command": "npx",
@@ -57,13 +57,18 @@ realm.set_servers({"web": {"transport": "sse", "url": "https://mcp.example.com/s
 # 或同样的事情用 mark_dirty 表达（只重连，配置对象自己替换）
 realm.mark_dirty()
 
-async for event in agent.run("查一下这个网页"):
-    ...  # 回合边界自动重连 → 换工具集 → 工具 schema 变 ⇒ CacheEpoch +1
+stream = agent.stream()                      # 先开流（不回放，注册发生在 __aiter__）
+iterator = stream.__aiter__()
+agent.push("查一下这个网页", id="mcp-check")   # 回合边界自动重连 → 换工具集 ⇒ CacheEpoch +1
+async for event in iterator:
+    ...                                      # 消费到终态帧（done / interrupted / error）
+await stream.aclose()
 ```
 
 - 单个 server 连不上：记 `status()` 里的 `error`，其它 server 照常可用；
 - 所有 server 都连不上且 `strict=True`：realm 启动失败（`RealmManager` 标 `failed`）；
-- 失败不会自动无限重试：宿主再次 `mark_dirty()` 才会重连。
+- 失败的 server 按指数退避重连（`retry_initial` 默认 30s，上限 `retry_max` 默认 300s）；
+  宿主再次 `mark_dirty()` / `set_servers()` 会清掉退避，下个回合边界立刻重试。
 
 ## 自定义传输 / 测试
 

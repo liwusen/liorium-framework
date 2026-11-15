@@ -7,6 +7,8 @@ pytest 在 prepend 模式下会把它们都当同名顶层模块 ``conftest`` �
 
 from __future__ import annotations
 
+import asyncio
+import itertools
 import json
 from pathlib import Path
 from typing import Any, Iterator, Sequence
@@ -15,6 +17,8 @@ from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+
+from liorium.core.types import Event
 
 
 class ScriptedChatModel(BaseChatModel):
@@ -112,4 +116,48 @@ def events_json(events: list[Any]) -> str:
     return json.dumps([e.to_dict() for e in events], ensure_ascii=False)
 
 
-__all__ = ["ScriptedChatModel", "events_json", "make_scripted_factory", "write_workspace"]
+_ENTRY_SEQ = itertools.count(1)
+"""``collect_turn`` 默认条目 id 的计数器（同一测试进程内唯一）。"""
+
+_TERMINAL_EVENTS = frozenset({"done", "interrupted", "error"})
+
+
+async def collect_turn(
+    agent: Any,
+    text: str,
+    *,
+    id: str | None = None,
+    timeout: float = 10.0,
+    **kwargs: Any,
+) -> list[Event]:
+    """push 一条条目并收齐"这一回合"的事件（到终态帧为止）。
+
+    ``kwargs`` 透传给 ``push``（bucket / flags / origin / timeout / context）。
+
+    先 ``stream(ids=[entry_id])`` 再 ``push``：订阅发生在 ``__aiter__``，反过来会
+    漏掉 ``input.accepted`` 甚至整个回合的首帧。``timeout`` 是**单帧**等待上限；
+    回合跑得久但持续出帧不受影响。返回的列表包含入站生命周期帧（``input``）——
+    需要旧 ``run()`` 语义的调用方自己过滤 ``event.type == "input"``。
+    """
+    entry_id = id or f"test:{next(_ENTRY_SEQ)}"
+    subscription = agent.stream(ids=[entry_id])
+    iterator = subscription.__aiter__()
+    events: list[Event] = []
+    try:
+        agent.push(text, id=entry_id, **kwargs)
+        while True:
+            event = await asyncio.wait_for(iterator.__anext__(), timeout=timeout)
+            events.append(event)
+            if event.type in _TERMINAL_EVENTS:
+                return events
+    finally:
+        await subscription.aclose()
+
+
+__all__ = [
+    "ScriptedChatModel",
+    "collect_turn",
+    "events_json",
+    "make_scripted_factory",
+    "write_workspace",
+]

@@ -23,6 +23,8 @@ dependencies = [
     # 允许 import liorium.agent（2026-11-06 起），本包当前未使用。
     "liorium-vfs",
     "langchain-core>=1.6,<1.7",
+    # MemoryRealm.Config：profile 用它校验 + 填默认（2026-11-14 起 realm 自组装）。
+    "pydantic>=2.7,<3",
 ]
 
 [project.optional-dependencies]

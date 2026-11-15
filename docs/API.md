@@ -6,7 +6,7 @@
 
 约定：
 
-- 12 个模块共用同一个顶层包名：`from liorium.agent import LioriumAgent`。开发期这 12 个目录
+- 13 个模块共用同一个顶层包名：`from liorium.agent import LioriumAgent`。开发期这 13 个目录
   各自是可编辑安装的命名空间包；发布版把它们打进同一个 wheel，`liorium/__init__.py` 提供
   `__version__`。两种情况下的导入路径完全一致；
 - 所有 dataclass 都是 frozen（除 `RealmContext`、`RealmRecord`、`ToolRuntime` 等运行期对象）；
@@ -32,9 +32,9 @@
 | `ContextItem` | `ContextItem(source: str, text: str, meta: dict = {}, interrupt: bool = False)` | 一条注入上下文；`source` 不能为空、`text` 必须是 `str`；`interrupt` 当前只被记录、不生效 |
 | `render_context_block` | `render_context_block(items: list[ContextItem], at: str) -> str` | 渲染成可并入 user 消息的文本块；`at` 是宿主时钟的 `HH:MM` |
 | `Event` | `Event(type: str, payload: dict = {})` | 一条事件；未知 `type` 抛 `ValueError`。`to_dict()` 返回 `{"type": ..., **payload}` 扁平形态；支持 `event["k"]` / `event.get("k")` |
-| `AGENT_EVENT_TYPES` | `("start", "delta", "reasoning_delta", "tool_start", "tool_result", "compact_start", "compact_delta", "compact_done", "done")` | `run()` 只产出这 9 种（`tests/test_event_contract.py` 冻结） |
+| `AGENT_EVENT_TYPES` | `("start", "delta", "reasoning_delta", "tool_start", "tool_result", "compact_start", "compact_delta", "compact_done", "done", "round_aborted", "interrupted", "error", "input", "realm")` | 事件流原生后共 14 种（`tests/test_event_contract.py` 冻结）；前 13 种顺序不变，`realm` 2026-11-14 只在尾部追加 |
 | `ALL_EVENT_TYPES` | 等于 `AGENT_EVENT_TYPES` | `Event` 的合法类型全集（宿主事件已于 2026-11-08 删除） |
-| `ev_start` | `ev_start(turn_id: str) -> Event` | 事件构造快捷方式（其余 `ev_*` 同理） |
+| `ev_start` | `ev_start(turn_id: str, *, origin: str = "user", inputs: Sequence[str] = ()) -> Event` | payload：`turn_id` / `origin` / `inputs` |
 | `ev_delta` | `ev_delta(content: str) -> Event` | |
 | `ev_reasoning_delta` | `ev_reasoning_delta(content: str) -> Event` | |
 | `ev_tool_start` | `ev_tool_start(tool_name: str, args: Any, call_id: str) -> Event` | |
@@ -42,7 +42,12 @@
 | `ev_compact_start` | `ev_compact_start() -> Event` | payload 为空 |
 | `ev_compact_delta` | `ev_compact_delta(content: str) -> Event` | |
 | `ev_compact_done` | `ev_compact_done(ok: bool) -> Event` | 压缩中间件失败时会直接构造 `Event("compact_done", {"ok": False, "error": "..."})` |
-| `ev_done` | `ev_done(turn_id: str) -> Event` | |
+| `ev_done` | `ev_done(turn_id: str) -> Event` | payload 只有 `turn_id`（**没有** `final_text`） |
+| `ev_round_aborted` | `ev_round_aborted(turn_id: str, reason: str = "preempted") -> Event` | 非终态：模型轮被 `IMMEDIATE` 切掉 |
+| `ev_interrupted` | `ev_interrupted(turn_id: str, reason: str) -> Event` | 终态；`reason` 常见 `user` / `close`（调用方自定义字符串原样透传；抢占**不走**这条，见 `round_aborted`） |
+| `ev_error` | `ev_error(turn_id: str, error: str) -> Event` | 终态；`error` 是 `"类名: 消息"`，不带 traceback |
+| `ev_input` | `ev_input(input_id: str, state: str, turn_id: str \| None = None) -> Event` | 入站生命周期：`accepted` / `delivered` / `expired` / `dropped`；`turn_id` 只在已知时写入 |
+| `ev_realm` | `ev_realm(realm: str, name: str, data: dict \| None = None, turn_id: str \| None = None) -> Event` | realm 主动推送（2026-11-14）：`{realm, name, data}`，**非终态、不开回合**；`data` 复制一份，调用方改原 dict 不影响事件 |
 
 ### 1.2 URI
 
@@ -90,9 +95,8 @@
 | `NodeNotFoundError` | 路径不存在 |
 | `VfsReadOnlyError` | 对只读挂载/节点写入 |
 | `ContentTypeError` | 内容类型不支持该操作 |
-| `TurnInterrupted` | 回合被 `interrupt()` 或抢占取消；字段 `reason`（抢占时是 `"preempted"`） |
-| `TurnDropped` | 回合在排队阶段被丢弃（`FLAG.DROPPABLE` + 拥塞）；字段 `reason`，从未开始执行 |
-| `TurnError` | 回合失败；字段 `message`、`cause` |
+| `TurnInterrupted` | 回合被 `interrupt()` / `close()` 取消；字段 `reason`（`user` / `close` 或调用方自定义）。由 worker 翻译成 `interrupted` 终态帧；`IMMEDIATE` 抢占**不**产生它（走 `round_aborted` + 同一回合续跑） |
+| `TurnError` | 回合失败或生命周期错误（`push()` 早于 `start()` / 晚于 `close()`）；字段 `message`、`cause`。回合内失败翻译成 `error` 终态帧 |
 | `CheckpointError` | checkpoint 打开/读/写失败 |
 
 ### 1.4 端口（子模块 `liorium.core.ports`）
@@ -273,8 +277,8 @@ property `scheme`。
 |---|---|---|
 | `CORE_REALM_ID` | `"core"` | realm id（`RealmSpec(id=...)` 与工厂键） |
 | `CoreToolRealm` | `CoreToolRealm(spec, *, artifacts=None)` | `BaseRealm` 子类：`id="core"`、`instance_scope="agent"`、`state_scope="agent"`、无挂载、无周期上下文 |
-| 工具子集 | `params={"tools": ...}` > `AgentSpec.toolsets["default"]` > 六个全给 | 未知名字由 `build_core_tools` 抛 `ValueError` ⇒ realm 标 `failed` |
-| `params` | `tools`、`max_tool_output_chars`（默认 120） | 必须在 `RealmSpec.params` 里（参与指纹） |
+| 工具子集 | `config={"tools": ...}` > `AgentSpec.toolsets["default"]` > 六个全给 | 未知名字由 `build_core_tools` 抛 `ValueError` ⇒ realm 标 `failed` |
+| `config` | `tools`、`max_tool_output_chars`（默认 120） | 在 `RealmSpec.config` 里（参与指纹）；`params` 是旧别名 |
 | 运行时依赖 | `RealmContext.vfs` / `workspace_root` / `artifacts` | 由 Agent 填；独立使用时用 `CoreToolRealm(spec, artifacts=...)` |
 
 `prompt_fragment()` 只描述本实例实际挂上的工具（子集里没有 `execute` 就不提它）。
@@ -320,24 +324,12 @@ BootSpec(message: str | None = None)
 #### `RealmSpec`
 
 ```python
-RealmSpec(id: str, params: Mapping[str, Any] = {}, requires: tuple[str, ...] = ())
+RealmSpec(id: str, config: Mapping[str, Any] = {}, requires: tuple[str, ...] = ())
 ```
 
-`id` 非空；`params` 会被 `fingerprint()` 试算一次，不可序列化直接 `SpecError`
-（避免不可指纹化的参数污染 `apply()`）。
-
-#### `Profile`
-
-```python
-Profile(id: str, realms: tuple[RealmSpec, ...] = (), prompt_sources: tuple[str, ...] = (),
-        toolsets: Mapping[str, tuple[str, ...]] = {})
-```
-
-| 成员 | 签名 | 语义 |
-|---|---|---|
-| `id` | `str` | 非空；realm id 在 profile 内不可重复 |
-| `expand` | `expand(spec: AgentSpec) -> AgentSpec` | 合并进 spec（不改原 spec）：profile 的 realm 在前、同 id 以 spec 为准；`prompt_sources` 去重合并；`toolsets` 同名 key 以 spec 为准 |
-
+`id` 非空；`config` 是 canonical 名字（`params` 是只读别名，旧宿主不用改），会被
+`fingerprint()` 试算一次，不可 JSON 序列化直接 `SpecError`（避免不可指纹化的参数污染
+`apply()`）。profile 加载时 `config` 已经由 realm 自己的 `Config` 模型校验并补过默认值。
 #### `AgentSpec`
 
 ```python
@@ -364,7 +356,6 @@ AgentSpec(
 | `with_realms` | `with_realms(realms: tuple[RealmSpec, ...]) -> AgentSpec` | 不可变变换 |
 | `with_toolsets` | `with_toolsets(toolsets: Mapping[str, tuple[str, ...]]) -> AgentSpec` | |
 | `with_limits` | `with_limits(limits: Limits) -> AgentSpec` | |
-| `with_profile` | `with_profile(profile: Profile) -> AgentSpec` | 语法糖；非 `Profile` 抛 `SpecError` |
 
 不变量：`realms` 里出现非 `RealmSpec` 或 id 重复 → `SpecError`；`toolsets` 的 key 不能为空；
 身份（`id` / `inbox_dir`）不参与指纹，也不允许通过 `apply()` 变更。
@@ -385,7 +376,8 @@ LioriumAgent(
     api_format: str | None = None,
     checkpoint_path: Path | None = None,
     thread_id: str | None = None,
-    priority: int = 0,
+    batch_window: BatchWindow | None = None,
+    env_interval: float = 30.0,
     system_prompt_override: str | None = None,
 )
 ```
@@ -401,20 +393,24 @@ LioriumAgent(
 | `checkpoint` | `CheckpointStore` | `AsyncSqliteSaver` 生命周期；默认 `<inbox>/checkpoint.db` |
 | `artifacts` | `ArtifactStore` | 默认 `OutputStore(root=<inbox>/artifacts)` |
 | `thread_id` | `str` | 顶层默认 `"main"`（能读旧库），子代理默认自己的 `spec.id` |
-| `priority` | `int` | 本 Agent 的**默认**调度优先级（子代理是父 -1）；`run(priority=...)` 可按次覆盖，越大越优先 |
+| `batch_window` | `BatchWindow \| None` | `BATCHED` 的合批窗口（`None` = `inbox.py` 默认值 `quiet_gap=2.5 / min_age=0 / max_age=15 / max_size=100`）。**不进 `AgentSpec`、不参与指纹**：改窗口不该触发 `apply()` 重建图 |
+| `env_interval` | `float` | `ENVIRONMENT` 回合**中途**投递的最小间隔（秒，默认 30；`<= 0` ⇒ 每个安全点都投）。按"上一次投递"计时，回合开始那条路径不受节流但会重置计时器。同样**不进 `AgentSpec`** |
 | `graph` / `model` / `tools` / `epoch` / `started` | property | 运行时快照，`tools` 返回副本。**工具全部来自 realm**：没装配任何 realm ⇒ `tools == []`（零工具合法，`start()` 只记一条 INFO） |
-| `start` | `async start() -> None` | 起 realm / 开 checkpoint / 建图 / 播种 system 消息；**不调模型**；已 close 再 start 抛 `TurnError` |
-| `close` | `async close() -> None` | 幂等；内部 `interrupt(reason="agent_close")` + 停 realm + 关 checkpoint |
-| `run` | `run(text: str, *, context: Sequence[ContextItem] = (), origin: str = "user", priority: int \| None = None, flags: FLAG = FLAG.NONE) -> AsyncIterator[Event]` | **只产出这一条消息**的事件；未 `start()` 抛 `TurnError`；迭代结束 = 回合结束；等待执行位期间不产出事件 |
-| `inject` | `async inject(items: Sequence[ContextItem]) -> None` | 永不打断；单个 `ContextItem` 也接受 |
-| `interrupt` | `async interrupt(*, reason: str = "") -> bool` | 取消当前回合；空闲返回 `False` |
+| `start` | `async start() -> None` | 起 realm / 开 checkpoint / 建图 / **拉起常驻 worker**；**不调模型**；幂等；已 close 再 start 抛 `TurnError` |
+| `close` | `async close() -> None` | 幂等；取消当前回合（发 `interrupted(close)`）+ 丢弃 pending（**不发帧**）+ 停 worker + 停 realm + 关 checkpoint |
+| `push` | `push(text: str, *, id: str, bucket: Bucket = Bucket.MAJOR, flags: Flag = Flag.NONE, origin: str = "user", timeout: float \| None = None, context: Sequence[ContextItem] = ()) -> None` | **同步、无返回值、入队即返回**；`id` 必填（流的关联键）；未 `start()` / 已 `close()` 抛 `TurnError`；`Flag.AUTO` + `Bucket.IMMEDIATE` 抛 `ValueError`。「何时开口」不归 Core：节奏控制由适配器在 `push` 之前完成 |
+| `stream` | `stream(*, ids: Sequence[str] \| None = None) -> AsyncIterator[Event]` | **同步**返回订阅对象；可开多个、**不回放**；注册发生在 `__aiter__`；`ids` 只放行相关回合的帧与这些 id 的 `input` 帧 |
+| `inject` | `inject(items: Sequence[ContextItem] \| ContextItem) -> None` | **同步**；直写 `ContextChannel`，不经 Inbox、不发 `input` 帧、永不打断 |
+| `interrupt` | `async interrupt(*, reason: str = "user") -> bool` | 取消当前回合（模型流 / 工具 / 本回合托管任务），**队列保留**；空闲返回 `False` |
+| `send_to_realm` | `async send_to_realm(realm_id: str, name: str, data: Mapping \| None = None, *, origin: str = "host", timeout: float \| None = None) -> Any` | **宿主 → realm** 的唯一公共入口（2026-11-14）：把 `RealmMessage` 交给运行中的 realm，**立即执行、等结果**；错误语义见 §4.6 的 `RealmMessage` 表 |
 | `apply` | `async apply(spec: AgentSpec, *, force: bool = False) -> ApplyResult` | 差量替换；`id`/`inbox_dir` 变了抛 `SpecError`；失败保留旧部件。`force=True` 即使指纹没变也重建运行时（调用方侧模型参数变了，例如思考强度）；`ApplyResult.forced` 标记 |
 | `refresh_realms` | `async refresh_realms(*, force: bool = True) -> bool` | 返回是否真的刷新过；未 start 抛 `TurnError` |
 | `set_realm_enabled` | `async set_realm_enabled(realm_id: str, enabled: bool) -> bool` | 运行期开/关一个**已装配**的 realm 并重建运行时：工具 / 挂载 / prompt 段随之撤下或恢复，`epoch` 相应 +1。返回调用后是否在运行（启动失败按 §C5 降级为 `failed`，原因见 `status()`）；未装配抛 `RealmNotFoundError` |
 | `reset_dialog` | `async reset_dialog() -> None` | 清空对话 + 重写 system 段（不调模型）；清 `conversation` scope 状态 |
 | `status` | `status() -> AgentStatus` | 可序列化快照 |
 
-刻意不存在：`invoke()` / `submit()` / `events()` / `notify()`。
+刻意不存在：`run()`（2026-11-12 删除，改 `push()` + `stream()`）、`invoke()` / `submit()` /
+`events()` / `notify()`。
 
 ### 4.3 状态对象
 
@@ -447,13 +443,20 @@ ApplyResult(changed: tuple[str, ...] = (), skipped: tuple[str, ...] = (),
 AgentStatus(agent_id: str, running: bool = False, turn_id: str | None = None,
             queue_depth: int = 0, spec_fingerprint: str = "", epoch: CacheEpoch = CacheEpoch(),
             realms: tuple[RealmStatus, ...] = (), messages: int = 0,
-            pending_context: int = 0, started: bool = False, closed: bool = False)
+            pending_context: int = 0,
+            pending_by_bucket: tuple[tuple[str, int], ...] = (),
+            started: bool = False, closed: bool = False)
 
 RealmStatus(id: str, state: RealmState = "pending", error: str | None = None,
             tools: tuple[str, ...] = (), mounts: tuple[str, ...] = (),
             shared: bool = False,
             context_due: int = 0, context_injections: int = 0)
 ```
+
+`running` = 是否有回合在跑；`turn_id` = 当前回合 id（空闲 `None`）。
+`queue_depth` = **Inbox 深度**（所有待处理条目，含 `BATCHED` / `ENVIRONMENT`）；
+`pending_context` 保持原义（`ContextChannel` 待物化数）；`pending_by_bucket` = 桶名（大写）→
+待处理条数，**四个桶恒出现**（没有则为 0），供适配器的闸门判断"该回的有几条、可丢的有几条"。
 
 `RealmState = Literal["pending", "starting", "running", "failed", "stopped"]`（子模块导出）。
 
@@ -463,29 +466,45 @@ RealmStatus(id: str, state: RealmState = "pending", error: str | None = None,
 `context_due`：第五拍还有几回合到期（`0` = 本回合就问；不参与周期上下文的 realm 恒为 `0`）。
 `context_injections`：本进程内成功注入次数（`ctx.inject()` 推送不计入）。
 
-### 4.4 调度：`FLAG` / `priority` / `TurnDropped`
+### 4.4 调度：`Bucket` / `Flag` / 终态帧
 
 ```python
-class FLAG(IntFlag):
-    NONE = 0
-    INTERRUPTING = 1   # 可抢占正在跑的低优先级回合
-    EXCLUSIVE = 2      # 拒绝被抢占
-    DROPPABLE = 4      # 拥塞时可被丢弃
+class Bucket(str, Enum):        # 条目「何时投递」，不表达业务优先级
+    IMMEDIATE = "immediate"     # 立刻；可在安全点接管在途且未外化的模型轮
+    MAJOR = "major"             # 排队，等当前回合结束
+    BATCHED = "batched"         # 参与合批窗口，到期后开自己的回合（整批一条消息）
+    ENVIRONMENT = "environment" # 不触发投递、不刷新合批、永不开回合；回合中途按 env_interval 节流投递
 
-DEFAULT_FLAGS = FLAG.NONE
-QUEUE_MAX = 50
+class Flag(IntFlag):
+    NONE = 0
+    EXCLUSIVE = 1   # 本条开启的回合拒绝被 IMMEDIATE 抢占
+    DROPPABLE = 2   # Inbox 深度 >= QUEUE_MAX 时丢弃
+    AUTO = 4        # 运行时决定形态（仅 MAJOR；与 IMMEDIATE 互斥）
+
+class BatchWindow:              # 只对 BATCHED 生效
+    quiet_gap: float = 2.5
+    min_age: float = 0.0
+    max_age: float = 15.0
+    max_size: int = 100
+
+QUEUE_MAX = 50                  # runtime/inbox.py
+ENV_INTERVAL = 30.0             # Inbox(env_interval=...) 的默认值
 ```
 
-| 名字 | 签名 | 语义 |
-|---|---|---|
-| `FLAG` | 见上 | 一次 `run()` 的调度标志，正交可组合；位值冻结（`test_scheduler.py`） |
-| `DEFAULT_FLAGS` | `FLAG.NONE` | 默认可被抢占、不抢别人、拥塞时不丢 |
-| `run(priority=...)` | `int \| None` | 调用级优先级，**越大越优先**；`None` 用 `self.priority`（构造参数，默认 0；子代理父 -1）。同档 FIFO |
-| `run(flags=...)` | `FLAG` | `INTERRUPTING` 只在优先级**严格更高**且对方非 `EXCLUSIVE` 时生效；被抢占方抛 `TurnInterrupted(reason="preempted")` |
-| `TurnDropped` | `TurnDropped(reason: str = "congested")` | `DROPPABLE` 且 `queue_depth() >= QUEUE_MAX` 时抛；回合**从未开始**，不产生事件 |
-| `QUEUE_MAX` | `50` | 只有 `DROPPABLE` 受它影响；其它回合无限排队 |
+| 名字 | 语义 |
+|---|---|
+| `Bucket` | 只有 `ENVIRONMENT` 永不开回合（`Bucket.opens_turn`）：`BATCHED` 在合批窗口到期后开自己的回合，忙时排队；桶之间**没有优先级阶梯**，`IMMEDIATE` 只是插队 + 可在安全点接管 |
+| `Flag` | 正交可组合；`AUTO` 只对 `MAJOR` 有意义、与 `IMMEDIATE` 互斥（`ValueError`）；`EXCLUSIVE` 不挡 `interrupt()` / `close()` |
+| `BatchWindow` | `deliver_at = min(first + max_age, max(first + min_age, last + quiet_gap))`；到 `max_size` 立即开回合（整批一条 user 消息）；**不进 `AgentSpec`** |
+| `ENVIRONMENT` 投递 | 回合开始整批搭车（形态①，不受节流、会重置计时器）→ 批回合一起走 → 回合进行中在安全点由 `Inbox.take_environment()` 取用（形态②独立 `<context>`），两次投递至少间隔 `env_interval`；"上一次投递"起算，首次立即可投；空闲期不投递、不唤醒 |
+| 同 id 替换 | pending 中同 `id` ⇒ 原位替换（位置不动、继承合批锚点、`timeout` 从本次 push 重算） |
+| `timeout` | 消费截止时间：物化前到期即作废，发 `input.expired`；惰性扫描，不起定时器 task |
+| `QUEUE_MAX` | 只有 `DROPPABLE` 受它影响（深度 `>= 50` 即丢并发 `input.dropped`）；其它条目无限排队 |
+| 终态帧 | 每回合**恰好一条** `done` / `interrupted` / `error`，且是该回合最后一条事件；`done` 不带 `final_text`，`error` 不带 traceback |
 
-调度语义、抢占时序与不变量见 [`design/scheduler.md`](design/scheduler.md)。
+调度语义、`IMMEDIATE` 四相位、安全点与维护插队见
+[`design/event-stream.md`](design/event-stream.md)；执行位与删除清单见
+[`design/scheduler.md`](design/scheduler.md)。
 
 ### 4.5 `ContextChannel`
 
@@ -529,7 +548,8 @@ class Realm(Protocol):
 ```
 
 可选钩子（`BaseRealm` 有默认实现，协议里不强制）：`dirty()`、`mark_dirty()`、
-`clear_dirty()`、`async refresh()`、`skills()`。
+`clear_dirty()`、`async refresh()`、`skills()`、`context_items(turn)`、
+`async on_message(message)`（默认抛错 = 不接受消息）、六个 `on_turn_/on_model_/on_tool_` 只读钩子。
 
 #### `BaseRealm`
 
@@ -550,20 +570,64 @@ class BaseRealm:
 
 
 全部方法都有空实现：`tools()` / `prompt_fragment()` / `middleware()` / `mounts()` /
-`skills()` / `dirty()` / `mark_dirty()` / `start()` / `stop()` / `context_items()`。
+`skills()` / `dirty()` / `mark_dirty()` / `start()` / `stop()` / `context_items()` /
+`on_turn_start/end` / `on_model_start/end` / `on_tool_start/end`。
 `tools()` 默认收集 `@realm_tool` 方法；`start()/stop()` 默认挂 `self.ctx` 并调
 `on_start()/on_stop()`（§10.2）。
 **没有** `clear_dirty()` 的默认实现——`RealmManager` 会退化为 `mark_dirty(False)`。
+
+唯一的例外是 **`on_message(message)`**：默认实现**抛** `RealmError`（"不接受消息"），
+因为静默丢掉一条外部指令比报错更糟（2026-11-14，见下）。
+
+#### `RealmMessage` 与 `on_message`（宿主 → realm，2026-11-14）
+
+```python
+@dataclass(frozen=True)
+class RealmMessage:
+    realm_id: str                   # 目标 realm（框架填）
+    name: str                       # "todo.add" / "webhook.changed"
+    data: dict[str, Any] = {}       # 副本（改原 dict 不影响）
+    origin: str = "host"            # "host" / "webui" / "cron" / …
+```
+
+宿主侧入口（见 `LioriumAgent.send_to_realm`）：
+
+```python
+reply = await agent.send_to_realm("todo", "todo.add", {"text": "写 demo"})
+reply = await agent.send_to_realm("todo", "todo.add", {"text": "x"}, origin="webui", timeout=5)
+```
+
+realm 侧（`BaseRealm.on_message`，可 sync 可 async，返回值原样回给宿主）：
+
+```python
+async def on_message(self, message: RealmMessage) -> Any:
+    self.items.append(message.data["text"])
+    await self.save(items=self.items)
+    return f"已加入：{message.data['text']}"
+```
+
+| 规则 | 行为 |
+|---|---|
+| 执行位置 | **调用方的 task 里立即执行**：不排队、不等当前回合结束（与回合并发）⇒ handler 必须廉价，慢活 `ctx.spawn` |
+| 返回值 | handler 的返回值原样返回；`None` 合法（纯事件通知） |
+| 生命周期 | 未装配 `RealmNotFoundError`；状态非 `running`（停用 / 启动失败）`RealmError`；没实现 `on_message` `RealmError`；agent 未 `start` / 已 `close` `TurnError` |
+| 并发 | 同 realm 的消息彼此串行（`RealmRecord.send_lock`），`stop` / `restart` 会等手上那条消息 |
+| 树级 realm | 消息由**树根**那份实例处理（子 Agent 的 record 就是根的那条） |
+| 事件流 | **不自动发帧**（14 种类型不变）；想留痕就在 handler 里 `ctx.emit(...)` |
+| 禁止项 | handler 里调 `refresh_realms` / `set_realm_enabled` / `reset_dialog` / `close` 抛 `TurnError`（会互锁）；也不要向同一个 realm 递归 `send_to_realm` |
+| 模型请求 | 完全不变：消息不进历史、不过模型、不影响 prompt / 指纹 |
 
 #### `RealmContext`（子模块 `liorium.agent.realm`）
 
 ```python
 RealmContext(realm_id: str, vfs: VirtualFileSystem, state: JsonStateStore,
-             params: dict[str, Any] = {}, agent_id: str = "",
+             config: dict[str, Any] = {}, agent_id: str = "",
              inbox_dir: Path | None = None, workspace_root: Path | None = None,
              artifacts: Any = None, agent_spec: Any = None,
              conversation_id: str = "main",
-             tasks: RealmTaskScope = RealmTaskScope(), context: ContextSink | None = None)
+             tasks: RealmTaskScope = RealmTaskScope(), context: ContextSink | None = None,
+             host: RealmHost | None = None,
+             model_factory: Callable[[], Any] | None = None)
 ```
 
 | 成员 | 签名 | 语义 |
@@ -571,17 +635,64 @@ RealmContext(realm_id: str, vfs: VirtualFileSystem, state: JsonStateStore,
 | `log` | property | `liorium.realm.<realm_id>` logger |
 | `spawn` | `spawn(coro, *, name=None) -> asyncio.Task` | **唯一**允许的后台任务入口；`stop` 时统一取消 |
 | `state` | `JsonStateStore` | 见下 |
+| `config` | `dict[str, Any]` | 本条 realm 的配置（canonical；`RealmSpec.config` 的拷贝） |
+| `params` | property `-> dict[str, Any]` | `config` 的只读别名（旧 realm 兼容，2026-11-14） |
+| `model` | property `-> Any \| None` | 宿主的 aux 模型（`compact_model_factory`：不思考、无工具）；**每次访问都新建**，归工厂关，realm 不缓存；没注入工厂时为 `None`（2026-11-14） |
 | `inbox_dir` | `Path \| None` | Agent 根目录（能力包定位自己的数据） |
 | `workspace_root` | `Path \| None` | 裸路径基准（`AgentSpec.effective_workspace_root`），可能与 `inbox_dir` 不同 |
 | `artifacts` | `Any` | `ArtifactStore` 端口（Agent 的 `OutputStore`）；独立使用可为 `None` |
 | `agent_spec` | `Any` | 装配进 Agent 时的 `AgentSpec`（只读，`core` realm 用它读 `toolsets`） |
 | `conversation_id` | `str` | `state_scope="conversation"` 的分桶键 |
 | `context` | `ContextSink \| None` | 由 `RealmManager` 注入的 Context 通道（`queue(items)` 一个方法） |
+| `host` | `RealmHost \| None` | 由 `RealmManager` 注入的宿主端口；独立使用为 `None`（2026-11-14） |
 | `inject` | `inject(text, *, source=None, meta=None) -> None` | 推一条 Context 到下一个安全点；同步、永不打断；无通道或空文本抛 `RealmError` |
 | `inject_items` | `inject_items(items: Sequence[ContextItem]) -> None` | 推一批现成的（空序列是空操作） |
+| `emit` | `emit(name: str, data: Mapping \| None = None) -> None` | 往事件流推一帧 `realm`（2026-11-14）：同步、不开回合、非终态；**无宿主时是空操作**；空事件名抛 `RealmError` |
+| `push` | `push(text, *, bucket="environment", origin=None, timeout=None) -> str` | 投入站条目（完全复用 `LioriumAgent.push`）；默认 `ENVIRONMENT` 永不开回合，显式 `"major"` 才开；返回 `realm:<realm_id>:<n>`；无宿主抛 `RealmError` |
+| `interrupt` | `interrupt(reason="realm") -> bool` | 叫停当前回合（同步）；从工具里调用会连带取消工具自身；无宿主抛 `RealmError` |
+| `turn` | property `-> TurnInfo \| None` | 当前回合身份；没有回合（或没有宿主）为 `None` |
 
 `ContextSink` 是**结构协议**（只要求 `queue`）：`liorium.realm_base` 不许 import
 `liorium.agent`，所以不能直接标注 `ContextChannel`；`ContextChannel` 天然满足它。
+
+#### 只读钩子（2026-11-14）
+
+`BaseRealm` 上的六个 `async` 方法，全部默认空实现，覆盖即生效（`overrides_hook()` 判定）；
+框架只给**覆盖了**的 realm 装适配器（`RealmHooksMiddleware`），没覆盖的一个都不装。
+
+| 钩子 | 签名 | 时机 |
+|---|---|---|
+| `on_turn_start` | `async (turn: TurnInfo)` | `start` 帧之后、第一次模型调用之前 |
+| `on_turn_end` | `async (turn: TurnInfo, outcome: TurnOutcome)` | 收尾、**终态帧之前**；取消路径不保证 |
+| `on_model_start` | `async (call: ModelCall)` | 每次模型调用之前 |
+| `on_model_end` | `async (call: ModelCall, outcome: HookOutcome)` | 每次模型调用之后（失败也调） |
+| `on_tool_start` | `async (call: ToolCall)` | 每次工具执行之前 |
+| `on_tool_end` | `async (call: ToolCall, outcome: HookOutcome)` | 每次工具执行之后（工具抛异常也调，`ok=False`） |
+
+**没有 `nxt()`、没有返回值、拿不到 `ModelRequest` / `ToolCallRequest`** —— realm 不能改写模型请求
+（契约见 `docs/EXTENDING.md`）。进入按声明序、退出逆序；钩子异常只记日志。
+
+```python
+ModelCall(turn: TurnInfo | None, model: str, messages: tuple[Any, ...], index: int = 0)
+ToolCall(turn: TurnInfo | None, name: str, args: Mapping[str, Any], call_id: str = "")
+HookOutcome(ok: bool, error: str | None = None, elapsed_ms: int = 0)
+TurnOutcome(kind: str, error: str | None = None, elapsed_ms: int = 0)   # kind ∈ done/error/interrupted
+```
+
+`messages` 是 tuple 快照、`args` 是 `MappingProxyType`：只读。
+
+#### `RealmHost`（结构协议，2026-11-14）
+
+```python
+class RealmHost(Protocol):
+    def emit(self, name: str, data: Mapping[str, Any]) -> None: ...
+    def push(self, text: str, *, bucket: str = "environment",
+             origin: str = "", timeout: float | None = None) -> str: ...
+    def interrupt(self, reason: str = "realm") -> bool: ...
+    def turn_info(self) -> TurnInfo | None: ...
+```
+
+Agent 侧实现是 `liorium.agent.realm.host.RealmHostPort`（一个 realm 一份，绑定 `realm_id`）。
 
 #### `JsonStateStore`（子模块导出）
 
@@ -644,13 +755,14 @@ RealmManager(*, agent_id: str, vfs: VirtualFileSystem, state_dir: Path,
 | `attach_specs` | `attach_specs(specs: Iterable[Any]) -> None` | 登记 spec（`ctx.params` 来源） |
 | `status` | `status() -> list[Any]` | `list[RealmStatus]` |
 | `record` | `record(realm_id: str) -> RealmRecord` | 未装配抛 `RealmNotFoundError` |
+| `send` | `async send(realm_id: str, message: RealmMessage, *, timeout: float \| None = None) -> Any` | 宿主消息的实现层（2026-11-14，通常由 `LioriumAgent.send_to_realm()` 调用）：检查状态 → 取 `record.send_lock` → 调 `on_message()`；同 realm 串行，`stop` 会等它 |
 | `order` / `factories` / `conversation_id` | property / 属性 | 启动顺序、工厂表、会话 id |
 
 `RealmFactory`（子模块导出）：`Callable[[Any], Realm]`。
 
 #### 第五拍：`context_for_turn()` 的语义
 
-`LioriumAgent._run_iter` 在拿到执行位后调用一次，把返回值排进 `ContextChannel`；
+`TurnWorker._prepare_turn` 在回合开始时调用一次，把返回值排进 `ContextChannel`；
 `ContextMergeMiddleware` 在下一个安全点物化成独立 `<context>` user 消息。
 
 | 规则 | 行为 |
@@ -664,7 +776,7 @@ RealmManager(*, agent_id: str, vfs: VirtualFileSystem, state_dir: Path,
 | 归一化 | `None` / `str` / `ContextItem` / 序列；`str` 自动包成 `ContextItem(source=f"realm:{id}")`；空串丢弃；其它类型记 error 跳过 |
 | 异常 | 记 `realm context_items 失败，本回合跳过: <id>: <exc>`，只跳过该 realm，不改 `record.state` |
 
-`TurnInfo(index: int, id: str, origin: str = "user")`：`index` 是"本进程第几个 `run()`"，
+`TurnInfo(index: int, id: str, origin: str = "user")`：`index` 是"本进程第几个回合"，
 与事件里的 `turn_id`（`f"{agent_id}#{index}"`）同一个计数器。
 
 状态文件位置由 `state_scope` 决定：`agent` → `state_dir/<id>.json`；
@@ -673,7 +785,7 @@ RealmManager(*, agent_id: str, vfs: VirtualFileSystem, state_dir: Path,
 #### `SubagentRealm`
 
 ```python
-SubagentRealm(*, parent: LioriumAgent, params: dict[str, Any] | None = None)
+SubagentRealm(*, parent: LioriumAgent, config: dict[str, Any] | None = None)
 ```
 
 `id="subagents"`、`state_scope="agent"`、`instance_scope="tree"`。装配方式：spec 里写
@@ -812,9 +924,12 @@ MemoryRealm(
 )
 ```
 
-`id="memory"`、`requires=()`、`state_scope="agent"`。`RealmSpec.params` 键见 [MEMORY §8](MEMORY.md)
-（`db_path` / `content_dir` / `list_limit` / `keyword_index` / `vectors` / `extraction`）。
-**服务对象不进 params**（params 要参与指纹），用 realm 工厂闭包注入。
+`id="memory"`、`requires=()`、`state_scope="agent"`。`RealmSpec.config` 由
+`MemoryRealm.Config = MemoryConfig` 校验（见 [MEMORY §8](MEMORY.md)）：`dir` / `db_path` /
+`content_dir` / `list_limit` / `keyword_index` / `vectors` / `extraction` / `embed`。
+2026-11-14 起 realm **自组装**：`config.embed` 有值时自己造 embedding 后端与分块/实体向量库
+（需要 `liorium[vector]`），`config.extraction` 打开时用 `ctx.model` 造 `LlmExtractor`；
+自己造的服务由 `stop()` 关闭。宿主仍可显式注入服务（工厂闭包），注入的优先且不由 realm 关闭。
 
 | 成员 | 签名 | 语义 |
 |---|---|---|
@@ -949,6 +1064,8 @@ McpRealm(spec: Any = None, *, client_factory: Callable[[McpServerConfig], McpCli
 | `servers` | `{}` | `{server_id: {...}}` 或 `[{ "id": ..., ...}]`；配置见 `McpServerConfig` |
 | `strict` | `False` | 所有 server 都连不上时：`True` ⇒ realm 启动失败；`False` ⇒ 留空工具、记 error |
 | `prefix_tools` | `True` | 工具名是否加 `<server>_` 前缀 |
+| `retry_initial` | `30.0` | 失败 server 首次重连等待（秒），之后按 2 倍退避 |
+| `retry_max` | `300.0` | 退避上限（秒） |
 
 | 成员 | 签名 | 语义 |
 |---|---|---|
@@ -957,7 +1074,7 @@ McpRealm(spec: Any = None, *, client_factory: Callable[[McpServerConfig], McpCli
 | `tools` | `tools() -> list[Any]` | 按当前连接的工具规格构造（名字 `<server>_<tool>`） |
 | `prompt_fragment` | `prompt_fragment() -> str` | 列出已连接 server 与工具名 |
 | `skills` / `middleware` | `-> list[Any]` | 空 |
-| `dirty` / `mark_dirty` / `clear_dirty` | `-> bool` / `mark_dirty(flag: bool = True)` / `-> None` | 配置签名变了或宿主置脏 |
+| `dirty` / `mark_dirty` / `clear_dirty` | `-> bool` / `mark_dirty(flag: bool = True)` / `-> None` | 配置签名变了、宿主置脏，或失败 server 到了退避重试时间 |
 | `set_servers` | `set_servers(servers: Iterable[McpServerConfig \| Mapping[str, Any]] \| Mapping[str, Any]) -> None` | 替换配置并标脏（宿主唯一入口） |
 | `enabled_servers` | property `-> list[McpServerConfig]` | `enabled=True` 的配置 |
 | `clients` | property `-> dict[str, McpClient]` | 已连接 client 副本 |
@@ -975,10 +1092,9 @@ McpRealm(spec: Any = None, *, client_factory: Callable[[McpServerConfig], McpCli
 | `build_args_schema` | `build_args_schema(tool_name: str, schema: dict[str, Any] \| None) -> Any` | JSON Schema → pydantic 模型；无参数返回 `None`；schema 太怪时也返回 `None`（不阻断工具发现） |
 | `build_tool_description` | `build_tool_description(description: str, args_schema: Any) -> str` | 原文 + `Args:` 字段说明 |
 
-> **已知缺口**：当前 `McpRealm` 没有实现 `Realm.mounts()`，而 `RealmManager.start()` 会调用它，
-> 因此**经 `AgentSpec` 装配的 MCP realm 会被标 `failed`**（降级、不影响其它 realm）。
-> `packages/liorium-mcp/tests/test_mcp_realm.py` 直接用假 `ctx` 测 realm，覆盖不到这条装配路径。
-> 补一个 `def mounts(self): return {}` 即可接通；本文不把「MCP 工具已可用」写成既成事实。
+> `McpRealm` 显式实现 `mounts() -> {}`（MCP 不提供 VFS 挂载），经 `AgentSpec` 装配可正常启动，
+> `RealmManager.start()` 会照常取 `tools()` / `prompt_fragment()`。单个 server 连不上只影响
+> 它自己，`error` 记在 `realm.status()` 的对应项里；`strict=True` 且全部失败才让 realm 启动失败。
 
 ---
 
@@ -994,9 +1110,9 @@ McpRealm(spec: Any = None, *, client_factory: Callable[[McpServerConfig], McpCli
 |---|---|---|
 | `main` | `main(argv: Sequence[str] \| None = None) -> int` | 控制台入口；`main(["setup", …])` 直接转给 `liorium.cli.setup`；返回进程退出码（130 = Ctrl+C） |
 | `run_cli` | `async run_cli(argv=None, *, registry=None, model_factory=None, input_fn=input, install_signal=True, interactive=None) -> int` | 可嵌入的异步入口（测试/别的宿主复用）；`interactive=None` 时看 `sys.stdin.isatty()`，否则用它决定 REPL / 单轮 |
-| `build_parser` | `build_parser(*, config: Mapping[str, Any] \| None = None) -> argparse.ArgumentParser` | 参数表；`config` 是 `config.json` 内容（`None` = 不读配置文件）。优先级：命令行 > 环境变量 > `config.json` > 内置默认 |
-| `CliOptions` | `workspace`、`inbox`、`system_prompt`、`temperature`、`max_turns`、`thinking`、`show_reasoning`、`json_mode`、`color`、`show_banner`、`enable_core_tools`、`tools`、`enable_memory`、`enable_skills`、`enable_subagents`、`memory_dir`、`skills_dir`、`embed_*`、`enable_vectors`、`enable_extraction`、`models_dev_cache`、`config_file`、`providers_file`、`env_report` | 一次会话的配置 |
-| `CliSession` | `CliSession(registry, resolved, options, *, input_fn=input, ui=None, model_factory=None)` | `async start/close`、`async run_turn(text) -> bool`、`async repl() -> int`、`async handle_command(line) -> bool`；`/setup` 会热切模型 / 重建记忆 realm |
+| `build_parser` | `build_parser(*, config: Mapping[str, Any] \| None = None, profile: AgentProfile \| None = None) -> argparse.ArgumentParser` | 参数表；`config` 是 `config.json`（UI-only），`profile` 提供 `model` / `thinking` / `temperature` / `max_turns` 的默认值。优先级：命令行 > 环境变量 > profile / config > 内置默认 |
+| `CliOptions` | `workspace`、`inbox`、`workspace_explicit`、`inbox_explicit`、`profile_path`、`system_prompt`、`temperature`、`max_turns`、`thinking`、`show_reasoning`、`json_mode`、`color`、`show_banner`、`enable_memory`、`enable_skills`、`enable_todo`、`enable_subagents`、`models_dev_cache`、`config_file`、`providers_file`、`env_report` | 一次会话的配置（结构性设置不在这里：它们只在 profile 里；`*_explicit` 表示该路径是否被命令行显式覆盖） |
+| `CliSession` | `CliSession(registry, resolved, options, *, input_fn=input, ui=None, model_factory=None, profile=None)` | `async start/close`、`async run_turn(text) -> bool`、`async repl() -> int`、`async handle_command(line) -> bool`；`/setup` 会热切模型 / 重建记忆 realm / 改 profile |
 
 ### 8.2 子代理观测
 
@@ -1019,7 +1135,8 @@ McpRealm(spec: Any = None, *, client_factory: Callable[[McpServerConfig], McpCli
 |---|---|
 | `liorium.cli.providers` | `Provider`（= `ModelProvider`）、`ProviderRegistry`、`ResolvedModel`、`ProviderConfigError`、`make_chat_model`、`load_registry`、`ensure_registry`、`registry_from_args_or_prompt`（遗留）、`prompt_for_registry`、`save_registry`、`normalize_format`、`infer_format_from_url`、`default_config_candidates`、`DEFAULT_FORMAT`、`SUPPORTED_FORMATS`、`THINKING_DIALECTS` |
 | `liorium.cli.config` | `load_config` / `save_config` / `ensure_home` / `default_config`、`config_path` / `providers_path` / `home_dir` / `cache_dir`、`KEYS` / `DEFAULT_CONFIG` / `SECRET_KEYS`、`get_value` / `set_value` / `unset_value` / `coerce`、`mask_secret` / `describe_value`、`ConfigError`、`LIORIUM_HOME` / `LIORIUM_CONFIG_FILE` |
-| `liorium.cli.setup` | `main`（`liorium-cli setup`）、`build_parser`、`Ctx` / `make_ctx`、`providers_add/edit/remove/default/test/set_key/list/show`、`memory_show/set/enable/init/path`、`wizard` / `wizard_providers` / `wizard_memory`、`overview` / `print_overview`、`doctor` / `run_checks`、`ensure_layout` |
+| `liorium.cli.setup` | `main`（`liorium-cli setup`）、`build_parser`、`Ctx` / `make_ctx`、`providers_add/edit/remove/default/test/set_key/list/show`、`memory_show/set/enable/init/path`、`profile_show/path/init/validate/edit/migrate`、`wizard` / `wizard_providers` / `wizard_memory`、`overview` / `print_overview`、`doctor` / `run_checks`、`ensure_layout` |
+| `liorium.cli.profile` | `default_profile` / `resolve_profile_path` / `profile_candidates` / `ensure_profile`、`load` / `load_raw` / `save_raw`、`migrate_config_to_profile` / `migrate_to_profile` / `ui_only` / `has_assembly_settings`、`find_realm` / `ensure_realm` / `remove_realm` / `realm_config` / `set_realm_enabled`、`PROFILE_NAME` / `CORE_REALM` / `MEMORY_REALM` / `SKILLS_REALM` / `TODO_REALM` / `SUBAGENTS_REALM` |
 | `liorium.cli.env` | `EnvReport`、`EnvFileError`、`load_env`、`parse_env_file`、`write_env_file`、`default_env_candidates`、`env_bool/env_int/env_float/env_str/env_path`、`as_dict`、`ENV_PREFIX` |
 | `liorium.cli.ui` | `Ui`、`configure_streams`、`truncate`、`indent`、`short_json`、`clock`、`duration`、`char_count`、`local_time`、`memory_meta` |
 
@@ -1028,8 +1145,9 @@ McpRealm(spec: Any = None, *, client_factory: Callable[[McpServerConfig], McpCli
 配置优先级：**命令行 > 进程环境变量 > `./.env` / `./.env.local` > `~/.liorium/config.json` > 默认**；
 `LIORIUM_*` 前缀与 `--no-*` 开关一一对应（含 `LIORIUM_NO_SUBAGENTS`）。
 
-`~/.liorium/providers.json` 存 provider 与密钥（0600），`~/.liorium/config.json` 只存非密钥设置；
-两者都可缺省，`LIORIUM_HOME` 可整体改根目录。**两者都不存在时不提问**：`run_cli` 建空骨架后进
+`~/.liorium/providers.json` 存 provider 与密钥（0600），`~/.liorium/profile.json` 存 Agent
+装配（模型 / realm / 工具集 / 提示词），`~/.liorium/config.json` 只剩 UI 偏好；三者都可缺省，
+`LIORIUM_HOME` 可整体改根目录。**都不存在时不提问**：`run_cli` 生成默认 profile + 空骨架后进
 「未配置」REPL（只支持 `/setup`、`/show`、`/doctor`、`/init`、`/path`、`/exit`），
 非交互环境（`-p` / `--json` / 管道）则以退出码 2 提示先跑 `liorium-cli setup`。
 
@@ -1104,6 +1222,25 @@ models.dev：`--models-dev off|cache|refresh`（默认 `cache`）、`--models-de
 - 目录刷新/下载失败不阻塞启动；
 - 识别结果只改内存，不写回配置。
 
+### 9.5 `ChatModelPool`（2026-11-14）
+
+```python
+ChatModelPool(registry, *, thinking="medium", temperature=0.3, api_format=None,
+              timeout=180.0, max_retries=2, max_tokens=8192)
+```
+
+| 成员 | 签名 | 语义 |
+|---|---|---|
+| `chat` | property `-> ModelFactoryPort` | 主对话工厂（带思考强度）：`(label) -> 模型`，`aclose()` 转发给池 |
+| `compact` | property `-> ModelFactoryPort` | aux / compact 工厂：强制 `intensity=None`（不思考） |
+| `__call__` | `(label, *, purpose="chat") -> Any` | 懒建并缓存；缓存键 `(label, intensity, purpose)` |
+| `thinking` / `temperature` | 属性 | 运行期可改；下一次 `chat` 建新模型（旧模型仍由 `aclose` 关） |
+| `aclose` | `async () -> None` | 关掉池里所有模型；**幂等**；关完再用抛 `RuntimeError` |
+
+为什么需要它：模型能不能关，只有造它的层知道（`close_chat_model` 只关私有客户端，langchain
+默认客户端在模块级缓存里，关掉会让同 base_url 的模型永久不可用）。`LioriumAgent.close()` 只认
+`model_factory` / `compact_model_factory` 上的 `aclose()`，所以"谁造谁关"就落在池上。
+
 ---
 
 ## 10. `liorium.realm-base`
@@ -1117,7 +1254,7 @@ realm 的契约与写作 API（2026-11-07 从 `liorium-agent` 搬出）。模块
 
 | 名字 | 说明 |
 |---|---|
-| `Realm` / `BaseRealm` / `RealmContext` / `JsonStateStore` / `RealmTaskScope` / `RealmRecord` / `utc_stamp` | 与 §4.6 完全同一批对象（`is` 相同） |
+| `Realm` / `BaseRealm` / `RealmContext` / `JsonStateStore` / `RealmTaskScope` / `RealmRecord` / `RealmMessage` / `utc_stamp` | 与 §4.6 完全同一批对象（`is` 相同） |
 | `TurnInfo` | `TurnInfo(index: int, id: str, origin: str = "user")`；回合身份，`index` 与 `turn_id` 的序号是同一个计数器 |
 | `ContextSink` | 结构协议：`queue(items: Sequence[ContextItem]) -> None`；`RealmContext.context` 的类型，`ContextChannel` 天然满足 |
 | `realm_tool` | 见 §10.3 |
@@ -1127,7 +1264,7 @@ realm 的契约与写作 API（2026-11-07 从 `liorium-agent` 搬出）。模块
 
 ```python
 class BaseRealm:
-    def __init__(self, spec: Any = None) -> None: ...   # 存 spec / params；ctx=None；带 logger
+    def __init__(self, spec: Any = None) -> None: ...   # 存 spec / config；ctx=None；带 logger
 
     ctx: RealmContext | None      # start() 挂上，stop() 清空
     state: JsonStateStore         # property；未 start() 抛 RealmError
@@ -1135,11 +1272,12 @@ class BaseRealm:
     async def on_start(self) -> None               # 默认 start() 里调用
     async def on_stop(self) -> None                # 默认 stop() 里调用
     def tools(self) -> list[Any]                   # 默认收集 @realm_tool
+    async def on_message(self, message: RealmMessage) -> Any   # 宿主消息；默认抛 RealmError
 ```
 
 | 行为 | 语义 |
 |---|---|
-| `__init__(spec)` | `self.spec` / `self.params = dict(spec.params)`；类本身可直接当 `(spec) -> Realm` 工厂 |
+| `__init__(spec)` | `self.spec` / `self.config = dict(spec.config)`（`self.params` 是同一份的别名）；类本身可直接当 `(spec) -> Realm` 工厂 |
 | `start(ctx)` / `stop(ctx)` | 默认：`self.ctx = ctx` → `await self.on_start()`；`on_stop()` 之后清空 `ctx` |
 | `tools()` | 按类定义顺序收集 `@realm_tool` 方法；**没有标记方法时返回 `[]`，且不 import langchain** |
 | `save(**values)` | 有值先 `update_many`，然后**一定** `flush()`（补上"忘了 flush"的坑） |
@@ -1204,9 +1342,73 @@ def todo_list(include_finished: bool = False) -> str
 - `context_items()`：只读内存；仅当存在 `pending` / `processing` 时返回一条
   `ContextItem(source="realm:todo", meta={"open": n, "ids": [...]})`，正文按
   「processing → pending → blocked」排序并附「按状态更新」提醒；否则返回 `None`（不消费周期）；
-- 节奏可用 `RealmSpec(id="todo", params={"context_every": 10, "context_first": False})` 覆盖。
+- 节奏可用 `RealmSpec(id="todo", config={"context_every": 10, "context_first": False})` 覆盖。
 
 ### 11.4 宿主便利方法
 
 `todos(*, include_finished=False) -> list[Todo]`、`counts() -> dict[str, int]`、
 `summary_line() -> str`（CLI 的 `/todo` 与 `/status` 用）。
+
+---
+
+## 12. `liorium.profile`（2026-11-14，第 13 个包）
+
+`from liorium.profile import AgentProfile, ProfileBuild, build_profile`。把一份 `profile.json`
+编译成运行时的三件套：`AgentSpec` + realm 工厂表 + `ChatModelPool`。本包依赖 `agent` +
+`provider`，不依赖 `cli`。
+
+### 12.1 `AgentProfile`
+
+```python
+AgentProfile(
+    version: Literal[1],
+    id: str | None = None,
+    provider_file: str | None = None,
+    model: str | None = None,
+    thinking: str = "medium",
+    temperature: float = 0.3,
+    workspace: str | None = None,
+    inbox: str = ".liorium-cli/agent",
+    prompt: list[str] = [],
+    boot: BootConfig = BootConfig(message=None),
+    limits: LimitsConfig = LimitsConfig(),
+    toolsets: dict[str, list[str]] = {},
+    realms: list[RealmEntry] = [],
+)
+```
+
+| 成员 | 签名 | 语义 |
+|---|---|---|
+| `load` | classmethod `load(path, *, env=None) -> AgentProfile` | 读文件 + 全量校验（含导入 realm） |
+| `from_dict` | classmethod `from_dict(raw, *, base_dir=None, env=None, default_id=None, source="<dict>")` | 已解析的 JSON；`default_id` 缺失且没写 `id` ⇒ 报错 |
+| `build` | `build(*, registry=None, model=None) -> ProfileBuild` | 编译；`model` > `profile.model` > `registry.default_label()` |
+| `build_agent` | `build_agent(**ports) -> LioriumAgent` | `build().create_agent()` 的快捷方式 |
+| `base_dir` | `-> Path` | 相对路径的基准（profile 文件所在目录） |
+| `realm_factories` | `-> dict[str, Any]` | realm id → 类（内置 `subagents` 不在里面） |
+
+不变量：
+
+- `version` 必填且必须是 `1`；顶层 / realm / `Config` 一律 `extra="forbid"`；
+- 所有**字符串值**先展开 `${VAR}`（未定义 ⇒ 报错）与 `~`，`$$` 转义成字面 `$`；键名不动；
+- `realms[].source`：`pkg.mod:Class` 或 `./file.py:Class`（属性可点号链）；只有内置 `subagents`
+  可以省略 `source`；文件型 realm 按 `(路径, mtime_ns, size)` 缓存，改了重新执行，**不加 `sys.path`**；
+- 声明的 realm 类可以带 `Config`（pydantic 模型）：`load()` 用它校验并补默认值，`config` 落进
+  `RealmSpec.config`；没声明就原样透传；
+- `requires` 必须都指向本 profile 内存在的 realm；
+- `load()` **会执行本地代码**（eager import）：profile 是受信任配置；只查结构用
+  `setup profile validate --schema-only`。
+
+### 12.2 `ProfileBuild`
+
+```python
+ProfileBuild(profile, spec, realm_factories, registry, pool)
+```
+
+| 成员 | 签名 | 语义 |
+|---|---|---|
+| `create_agent` | `create_agent(**ports) -> LioriumAgent` | 未 `start()` 的 Agent；`spec/model_factory/compact_model_factory/realm_factories` 由 build 决定，传了 `TypeError` |
+| `close` | `async () -> None` | 只关模型池（幂等）；推荐顺序 `agent.close()` → `build.close()` |
+| `build_profile` | `build_profile(profile, *, registry=None, model=None) -> ProfileBuild` | 模块级函数（`AgentProfile.build` 的实体） |
+
+CLI 侧的 profile 接口见 §8.3：`--profile`、`setup profile show|path|init|validate|edit|migrate`、
+以及"`config.json` 只剩 UI"的迁移规则。

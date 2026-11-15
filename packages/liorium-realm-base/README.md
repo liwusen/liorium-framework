@@ -65,12 +65,17 @@ class TodoRealm(BaseRealm):
 | `skills()` | 否 | 预载进 prompt「技能清单」的条目 |
 | `context_every` / `context_first` / `context_origins` / `context_items(turn)` | 否 | 第五拍：周期上下文（2026-11-07 已接线）。`0` = 不参与；返回空不消费周期，见 [`docs/design/realm-context.md`](../../../docs/design/realm-context.md) |
 | `ctx.inject(text, source=..., meta=...)` / `ctx.inject_items(items)` | 否 | 推送侧：随时把 Context 排到下一个安全点（同步、永不打断） |
+| `ctx.emit(name, data)` / `ctx.push(text, ...)` / `ctx.interrupt(reason)` / `ctx.turn` | 否 | 主动出口（2026-11-14）：推 `realm` 事件帧 / 投入站条目 / 叫停回合 / 读当前回合 |
+| `Config`（类属性，pydantic `BaseModel`） | 否 | 声明本 realm 的配置模型（2026-11-14）：profile `load()` 用它校验并补默认值，`ctx.config` 拿到规范化结果 |
+| `ctx.model` | 否 | 宿主的 aux 模型（不思考、无工具），**每次访问新建**、归工厂关；没有时为 `None`（2026-11-14） |
+| `on_message(message: RealmMessage)` | 否 | **宿主消息**（2026-11-14）：`agent.send_to_realm()` 的落点，返回值原样回给宿主；默认实现抛 `RealmError`（= 不接受消息）。可 sync 可 async |
+| `on_turn_start/end` / `on_model_start/end` / `on_tool_start/end` | 否 | 只读钩子（2026-11-14）：只能观察，**没有 `nxt()` / 没有返回值**，不改模型请求 |
 
 ## 写作 API
 
 | 名字 | 作用 |
 |---|---|
-| `BaseRealm.__init__(spec=None)` | 存 `self.spec` / `self.params`；子类不写 `__init__` 也能当工厂 |
+| `BaseRealm.__init__(spec=None)` | 存 `self.spec` / `self.config`（`self.params` 是只读别名）；子类不写 `__init__` 也能当工厂 |
 | `self.ctx` | `RealmContext`（`start()` 之后可用，`stop()` 时清空） |
 | `self.state` | `JsonStateStore`；未 `start()` 时抛 `RealmError` |
 | `await self.save(**values)` | `update_many` + `flush`，补上「忘了 flush 就等于没存」的坑 |

@@ -11,11 +11,12 @@ from typing import Any, Iterator
 
 import pytest
 
+from liorium.cli import profile as cli_profile
 from liorium.cli.app import run_cli
 from liorium.cli.providers import ProviderRegistry
-from liorium.cli.session import CliOptions, CliSession, load_capability_realms
+from liorium.cli.session import CliOptions, CliSession
 from liorium.cli.ui import _local_time, _memory_meta
-from liorium.core.types import Text
+from liorium.core.types import Event, Text
 from liorium_testkit import ScriptedChatModel, write_workspace
 
 CONFIG = {
@@ -64,6 +65,32 @@ def stub_factory(responses: list[Any] | None = None):
     return factory
 
 
+def write_profile(
+    tmp_path: Path,
+    *,
+    core_tools: bool = True,
+    tools: tuple[str, ...] | None = None,
+    memory_dir: Path | None = None,
+    skills_dir: Path | None = None,
+) -> Path:
+    """写一份测试用 profile（默认五件套；结构差异只能靠文件，flags 只覆盖本次运行）。"""
+    data = cli_profile.default_profile()
+    if not core_tools:
+        data["realms"] = [entry for entry in data["realms"] if entry["id"] != "core"]
+    if tools is not None:
+        data["toolsets"] = {"default": list(tools)}
+    # 桩模型是脚本化的：自动抽取会偷走本该给对话用的回复，测试里一律关掉。
+    memory_config: dict[str, Any] = {"extraction": False}
+    if memory_dir is not None:
+        memory_config["dir"] = str(memory_dir)
+    cli_profile.find_realm(data, "memory")["config"] = memory_config  # type: ignore[index]
+    if skills_dir is not None:
+        cli_profile.find_realm(data, "skills")["config"] = {"skills_dir": str(skills_dir)}  # type: ignore[index]
+    path = tmp_path / "profile.json"
+    cli_profile.save_raw(path, data)
+    return path
+
+
 def make_session(
     tmp_path: Path,
     *,
@@ -74,10 +101,18 @@ def make_session(
     registry = ProviderRegistry.load(write_config(tmp_path))
     resolved = registry.resolve("stub::demo")
     workspace = write_workspace(tmp_path / "ws")
+    profile_path = write_profile(
+        tmp_path,
+        core_tools=overrides.pop("enable_core_tools", True),
+        tools=overrides.pop("tools", None),
+        memory_dir=overrides.pop("memory_dir", None),
+        skills_dir=overrides.pop("skills_dir", None),
+    )
     options = CliOptions(
         workspace=workspace,
         inbox=tmp_path / "inbox",
         color=False,
+        profile_path=profile_path,
         **overrides,
     )
     lines = input_lines or []
@@ -173,18 +208,16 @@ async def test_capability_realms_wired_by_default(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_memory_dir_and_skills_dir_params(tmp_path: Path) -> None:
+async def test_memory_dir_and_skills_dir_from_profile(tmp_path: Path) -> None:
     memory_dir = tmp_path / "mem"
     skills_dir = tmp_path / "skills"
     session, _ = make_session(tmp_path, memory_dir=memory_dir, skills_dir=skills_dir)
     await session.start()
     try:
         spec = session.agent.spec
-        assert spec.realm("memory").params == {
-            "db_path": str(memory_dir / "memory.sqlite"),
-            "content_dir": str(memory_dir / "content"),
-        }
-        assert spec.realm("skills").params == {"skills_dir": str(skills_dir)}
+        assert spec.realm("memory").config["dir"] == str(memory_dir)
+        assert spec.realm("memory").config["extraction"] is False
+        assert spec.realm("skills").config == {"skills_dir": str(skills_dir)}
         assert (memory_dir / "memory.sqlite").is_file()
         assert (memory_dir / "content").is_dir()
     finally:
@@ -236,7 +269,7 @@ async def test_repl_commands(tmp_path: Path, capsys) -> None:
     assert "技能目录为空" in out        # /skills（空目录）
     assert "（没有待办" in out          # /todo（空清单）
     assert "还没有子代理" in out        # /subagent（空）
-    assert "已刷新 realm" in out        # /reload
+    assert "已重读 profile" in out      # /reload
     assert "还没有物化的 Context" in out
     assert "收到" in out
 
@@ -314,20 +347,26 @@ async def test_memory_graph_command(tmp_path: Path, capsys) -> None:
     assert "关系 1 条" in out
 
 
-def test_memory_services_follow_cli_options(tmp_path: Path) -> None:
-    """没给 --embed-model 就只跑关键词；给了才注入向量/抽取服务。"""
+@pytest.mark.asyncio
+async def test_memory_services_come_from_realm_config(tmp_path: Path) -> None:
+    """CLI 不再自己拼 embed / 抽取服务：全在 ``memory`` realm 的 config 里（§4.2）。"""
     session, _ = make_session(tmp_path)
-    assert session._memory_services() == {}  # noqa: SLF001
-
-    session.options.embed_model = "fake-embed"
-    services = session._memory_services()  # noqa: SLF001
-    assert {"embedder", "vectors", "entity_vectors"} <= set(services)
-    assert "extractor" in services
-    assert services["embedder"].dim == 1536
-    assert services["vectors"].path == session.options.inbox / "memory" / "index" / "chunks.vdb"
-
-    session.options.enable_vectors = False
-    assert session._memory_services() == {}  # noqa: SLF001
+    await session.start()
+    try:
+        config = session.agent.spec.realm("memory").config
+        assert config["embed"] is None  # 没配 embed ⇒ 只跑关键词，不注入向量服务
+        assert set(config) == {
+            "dir",
+            "db_path",
+            "content_dir",
+            "vectors",
+            "embed",
+            "extraction",
+            "list_limit",
+            "keyword_index",
+        }
+    finally:
+        await session.close()
 
 
 @pytest.mark.asyncio
@@ -438,6 +477,52 @@ async def test_realm_command_startup_disabled_and_unknown(tmp_path: Path, capsys
 
 
 @pytest.mark.asyncio
+async def test_reload_rejects_identity_change(tmp_path: Path, capsys) -> None:
+    """``/reload`` 只热替换结构；``id`` / ``inbox`` 是身份，改了必须重启。"""
+    session, _ = make_session(tmp_path, inbox_explicit=False)
+    profile_path = session.options.profile_path
+    assert profile_path is not None
+    data = json.loads(profile_path.read_text(encoding="utf-8"))
+    data["workspace"] = str(tmp_path / "ws")
+    cli_profile.save_raw(profile_path, data)
+
+    await session.start()
+    try:
+        data["id"] = "other"
+        cli_profile.save_raw(profile_path, data)
+        await session.handle_command("/reload")
+        assert "profile 的 id 变了" in capsys.readouterr().out
+
+        data["id"] = "cli"
+        data["inbox"] = "elsewhere"
+        cli_profile.save_raw(profile_path, data)
+        await session.handle_command("/reload")
+        assert "profile 的 inbox 变了" in capsys.readouterr().out
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_realm_command_absent_from_profile(tmp_path: Path, capsys) -> None:
+    """profile 里没声明的 realm ≠ 被 flag 关掉：提示要指对地方。"""
+    session, _ = make_session(tmp_path)
+    profile_path = session.options.profile_path
+    assert profile_path is not None
+    data = json.loads(profile_path.read_text(encoding="utf-8"))
+    data["realms"] = [entry for entry in data["realms"] if entry["id"] != "todo"]
+    cli_profile.save_raw(profile_path, data)
+
+    await session.start()
+    try:
+        await session.handle_command("/realm enable todo")
+    finally:
+        await session.close()
+    out = capsys.readouterr().out
+    assert "profile 的 realms 里没有 todo" in out
+    assert "--no-todo" not in out
+
+
+@pytest.mark.asyncio
 async def test_realm_command_without_any_realm(tmp_path: Path, capsys) -> None:
     session, _ = make_session(
         tmp_path,
@@ -493,7 +578,7 @@ async def test_reload_picks_up_new_skill(tmp_path: Path, capsys) -> None:
     finally:
         await session.close()
     out = capsys.readouterr().out
-    assert "已刷新 realm" in out
+    assert "已重读 profile" in out
     assert "后装的技能" in out
 
 
@@ -511,17 +596,9 @@ async def test_reload_without_capabilities(tmp_path: Path, capsys) -> None:
     finally:
         await session.close()
     out = capsys.readouterr().out
-    assert "没有运行中的 realm 需要刷新" in out
+    assert "已重读 profile" in out
     assert "记忆功能未启用" in out
     assert "技能功能未启用" in out
-
-
-def test_load_capability_realms_reports_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setitem(sys.modules, "liorium.skills", None)
-    factories, errors = load_capability_realms(["memory", "skills", "nonsense"])
-    assert "memory" in factories
-    assert set(errors) == {"skills"}
-    assert "liorium.skills" in errors["skills"]
 
 
 def test_memory_meta_shows_local_time() -> None:
@@ -530,22 +607,6 @@ def test_memory_meta_shows_local_time() -> None:
     assert _memory_meta("2026-11-04T12:51:00Z", ("人物",)) == f"{local}  #人物"
     assert _local_time("") == "?"
     assert _local_time("不是时间") == "不是时间"  # 非预期格式原样显示
-
-
-@pytest.mark.asyncio
-async def test_missing_skill_package_degrades(tmp_path: Path, monkeypatch, capsys) -> None:
-    monkeypatch.setitem(sys.modules, "liorium.skills", None)
-    session, _ = make_session(tmp_path, input_lines=["/skills", "/exit"])
-    await session.start()
-    try:
-        assert session.agent.spec.realm_ids == ("core", "memory", "todo", "subagents")
-        await session.repl()
-    finally:
-        await session.close()
-    out = capsys.readouterr().out
-    assert "skills 能力不可用" in out
-    assert "pip install 'liorium'" in out
-    assert "技能功能未启用" in out
 
 
 async def _wait_until(predicate, *, timeout: float = 5.0) -> bool:
@@ -666,7 +727,8 @@ async def test_subagent_live_events_are_key_only(tmp_path: Path, capsys) -> None
 
 
 @pytest.mark.asyncio
-async def test_run_cli_json_mode(tmp_path: Path, capsys) -> None:
+async def test_run_cli_json_mode(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("LIORIUM_HOME", str(tmp_path / "home"))
     config = write_config(tmp_path)
     code = await run_cli(
         ["--config", str(config), "-p", "你好", "--json", "--workspace", str(tmp_path / "ws")],
@@ -684,10 +746,33 @@ async def test_run_cli_json_mode(tmp_path: Path, capsys) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_cli_capability_flags(tmp_path: Path, capsys) -> None:
+async def test_run_cli_auto_creates_profile(tmp_path: Path, monkeypatch, capsys) -> None:
+    """没有 profile 时自动建默认模板，并把 ``--config`` 写进 ``provider_file``。"""
+    home = tmp_path / "home"
+    monkeypatch.setenv("LIORIUM_HOME", str(home))
     config = write_config(tmp_path)
     code = await run_cli(
+        ["--config", str(config), "-p", "你好", "--json", "--workspace", str(tmp_path / "ws")],
+        model_factory=stub_factory(["建模板"]),
+        install_signal=False,
+    )
+    assert code == 0
+    profile_path = home / "profile.json"
+    assert profile_path.is_file()
+    assert json.loads(profile_path.read_text(encoding="utf-8"))["provider_file"] == str(config)
+
+
+@pytest.mark.asyncio
+async def test_run_cli_capability_flags(tmp_path: Path, monkeypatch, capsys) -> None:
+    """``--no-memory`` 只影响本次运行；技能目录走 profile 的 realm config。"""
+    monkeypatch.setenv("LIORIUM_HOME", str(tmp_path / "home"))
+    config = write_config(tmp_path)
+    profile_path = write_profile(tmp_path, skills_dir=EXAMPLE_SKILLS)
+    before = profile_path.stat().st_mtime_ns
+    code = await run_cli(
         [
+            "--profile",
+            str(profile_path),
             "--config",
             str(config),
             "-p",
@@ -698,27 +783,30 @@ async def test_run_cli_capability_flags(tmp_path: Path, capsys) -> None:
             "--inbox",
             str(tmp_path / "inbox"),
             "--no-memory",
-            "--skills-dir",
-            str(EXAMPLE_SKILLS),
-            "--memory-dir",
-            str(tmp_path / "mem"),
         ],
         model_factory=stub_factory(["flag 回复"]),
         install_signal=False,
     )
     assert code == 0
-    # 只关记忆：技能目录仍然生效，记忆库不该被创建
-    assert (tmp_path / "inbox" / "skill.d").parent.is_dir()
-    assert not (tmp_path / "mem").exists()
+    # 只关记忆：记忆库不该被创建
+    assert not (tmp_path / "inbox" / "memory").exists()
+    # flags 不回写 profile（G5）：内容与 mtime 都不变
+    assert profile_path.stat().st_mtime_ns == before
+    assert json.loads(profile_path.read_text(encoding="utf-8"))["realms"][1]["id"] == "memory"
     out = capsys.readouterr().out
     assert any(json.loads(line)["type"] == "done" for line in out.splitlines() if line.startswith("{"))
 
 
 @pytest.mark.asyncio
-async def test_run_cli_tools_subset(tmp_path: Path, capsys) -> None:
+async def test_run_cli_tools_subset(tmp_path: Path, monkeypatch, capsys) -> None:
+    """工具子集来自 profile 的 ``toolsets``（不再有 ``--tools`` flag）。"""
+    monkeypatch.setenv("LIORIUM_HOME", str(tmp_path / "home"))
     config = write_config(tmp_path)
+    profile_path = write_profile(tmp_path, tools=("read", "find"))
     code = await run_cli(
         [
+            "--profile",
+            str(profile_path),
             "--config",
             str(config),
             "-p",
@@ -728,8 +816,6 @@ async def test_run_cli_tools_subset(tmp_path: Path, capsys) -> None:
             str(tmp_path / "ws"),
             "--inbox",
             str(tmp_path / "inbox"),
-            "--tools",
-            "read,find",
             "--no-memory",
             "--no-skills",
             "--no-todo",
@@ -744,25 +830,29 @@ async def test_run_cli_tools_subset(tmp_path: Path, capsys) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_cli_rejects_conflicting_tool_flags(tmp_path: Path, capsys) -> None:
-    config = write_config(tmp_path)
+async def test_run_cli_rejects_bad_profile(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("LIORIUM_HOME", str(tmp_path / "home"))
+    bad = tmp_path / "bad.json"
+    bad.write_text('{"version": 2}', encoding="utf-8")
     code = await run_cli(
-        ["--config", str(config), "-p", "hi", "--tools", "read", "--no-core-tools"],
+        ["--profile", str(bad), "-p", "hi"],
         model_factory=stub_factory(),
         install_signal=False,
     )
     assert code == 2
-    assert "--tools 与 --no-core-tools" in capsys.readouterr().err
+    assert "profile 错误" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio
-async def test_run_cli_missing_config_returns_2(tmp_path: Path, capsys) -> None:
+async def test_run_cli_missing_config_returns_2(tmp_path: Path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("LIORIUM_HOME", str(tmp_path / "home"))
+    profile_path = write_profile(tmp_path)
     code = await run_cli(
-        ["--config", str(tmp_path / "nope.json"), "-p", "hi"],
+        ["--profile", str(profile_path), "--config", str(tmp_path / "nope.json"), "-p", "hi"],
         install_signal=False,
     )
     assert code == 2
-    assert "配置错误" in capsys.readouterr().err
+    assert "provider 文件不存在" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio
@@ -772,3 +862,18 @@ async def test_run_cli_list_models(tmp_path: Path, capsys) -> None:
     assert code == 0
     out = capsys.readouterr().out
     assert "stub::demo" in out and "stub::other" in out
+
+
+def test_render_event_new_frames(tmp_path: Path, capsys) -> None:
+    """新增帧：``input`` 不展示，``round_aborted`` / ``interrupted`` / ``error`` 有输出。"""
+    session, _ = make_session(tmp_path)
+    session._render_event(Event("input", {"id": "x", "state": "accepted"}))
+    assert capsys.readouterr().out == ""
+
+    session._render_event(Event("round_aborted", {"turn_id": "t1", "reason": "preempted"}))
+    session._render_event(Event("interrupted", {"turn_id": "t1", "reason": "user"}))
+    session._render_event(Event("error", {"turn_id": "t2", "error": "TurnError: boom"}))
+    out = capsys.readouterr().out
+    assert "本轮被打断" in out
+    assert "[已中断]" in out
+    assert "回合失败" in out and "TurnError: boom" in out

@@ -12,6 +12,7 @@ import pytest
 
 from live_support import make_live_factory
 from liorium.agent import AgentSpec, Limits, LioriumAgent
+from liorium_testkit import collect_turn
 
 pytestmark = pytest.mark.live
 
@@ -37,10 +38,8 @@ async def test_live_single_turn(agent_workspace: Path) -> None:
     )
     await agent.start()
     try:
-        text = ""
-        async for event in agent.run("用一句话回答：你是谁？"):
-            if event.type == "delta":
-                text += str(event.get("content") or "")
+        events = await collect_turn(agent, "用一句话回答：你是谁？", timeout=120.0)
+        text = "".join(str(e.get("content") or "") for e in events if e.type == "delta")
         assert text.strip(), "真模型没有返回任何内容"
         print("\n[live] 单轮回复:", text[:200])
     finally:
@@ -57,11 +56,11 @@ async def test_live_tool_cycle(agent_workspace: Path) -> None:
     )
     await agent.start()
     try:
-        events = []
-        async for event in agent.run(
-            "读一下 notes.txt 这个文件，然后用一句话告诉我第一行是什么。"
-        ):
-            events.append(event)
+        events = await collect_turn(
+            agent,
+            "读一下 notes.txt 这个文件，然后用一句话告诉我第一行是什么。",
+            timeout=120.0,
+        )
         types = [e.type for e in events]
         assert types[-1] == "done"
         assert "tool_start" in types, f"模型没有调用工具：{types}"

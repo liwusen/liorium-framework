@@ -33,7 +33,7 @@ class McpError(RuntimeError):
 
 @dataclass(frozen=True)
 class McpServerConfig:
-    """一个 MCP server 的连接配置（可序列化，进 ``RealmSpec.params``）。"""
+    """一个 MCP server 的连接配置（可序列化，进 ``RealmSpec.config``）。"""
 
     id: str
     transport: str = "stdio"

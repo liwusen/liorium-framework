@@ -1,6 +1,6 @@
-"""校验发布用的 wheel 里真的装了全部 12 个模块（CI / 本地都能跑）。
+"""校验发布用的 wheel 里真的装了全部 13 个模块（CI / 本地都能跑）。
 
-发布单元只有一个 ``liorium``，12 个模块靠 ``[tool.hatch.build.targets.wheel].force-include``
+发布单元只有一个 ``liorium``，13 个模块靠 ``[tool.hatch.build.targets.wheel].force-include``
 从各自的 ``packages/<包>/src/liorium/<子包>`` 注入。少写一条映射不会让构建失败，
 只会让 wheel 里悄无声息地缺一个模块 —— 所以用一个断言把它钉住。
 

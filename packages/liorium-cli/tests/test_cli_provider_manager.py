@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from liorium.cli import profile as cli_profile
 from liorium.cli.app import _prepare_registry, build_parser
 from liorium.cli.providers import ProviderRegistry
 from liorium.cli.session import CliOptions, CliSession
@@ -43,6 +44,14 @@ def stub_factory(responses: list | None = None):
     return factory
 
 
+def write_profile(tmp_path: Path) -> Path:
+    data = cli_profile.default_profile()
+    cli_profile.find_realm(data, "memory")["config"] = {"extraction": False}  # type: ignore[index]
+    path = tmp_path / "profile.json"
+    cli_profile.save_raw(path, data)
+    return path
+
+
 def make_session(tmp_path: Path, **overrides) -> CliSession:
     registry = ProviderRegistry.load(write_config(tmp_path))
     resolved = registry.resolve("stub::demo")
@@ -50,6 +59,7 @@ def make_session(tmp_path: Path, **overrides) -> CliSession:
         workspace=write_workspace(tmp_path / "ws"),
         inbox=tmp_path / "inbox",
         color=False,
+        profile_path=write_profile(tmp_path),
         models_dev_cache=tmp_path / "cache" / "api.json",
         **overrides,
     )
@@ -102,30 +112,34 @@ def test_models_dev_parser(monkeypatch):
     assert args.models_dev_cache == Path("x.json")
 
 
-def test_session_factory_passes_thinking(monkeypatch, tmp_path):
-    session = make_session(tmp_path, thinking="high")
+def test_pool_uses_profile_thinking_and_temperature(monkeypatch, tmp_path):
+    """profile/flag 的 thinking 与 temperature 由编译出的模型池负责（E2）。"""
+    session = make_session(tmp_path, thinking="high", temperature=0.9)
+    build = session._make_build()  # noqa: SLF001
     captured: dict = {}
 
-    def fake_make_chat_model(resolved, **kwargs):
+    def fake_build_chat_model(provider, model, **kwargs):
         captured.update(kwargs)
-        captured["label"] = resolved.label
+        captured["model"] = model
         return object()
 
-    monkeypatch.setattr("liorium.cli.session.make_chat_model", fake_make_chat_model)
+    monkeypatch.setattr("liorium.provider.pool.build_chat_model", fake_build_chat_model)
 
-    session._build_model("stub::demo", purpose="chat")
+    build.pool("stub::demo")
     assert captured["intensity"] == "high"
     assert captured["purpose"] == "chat"
-    assert captured["temperature"] == session.options.temperature
+    assert captured["temperature"] == 0.9
+    assert captured["model"] == "demo"
 
     captured.clear()
-    session._build_model("stub::demo", purpose="compact")
+    build.pool("stub::demo", purpose="compact")
     assert captured["intensity"] is None
     assert captured["purpose"] == "compact"
 
     # 同一 (label, intensity, purpose) 只构建一次
-    session._build_model("stub::demo", purpose="chat")
-    assert captured["label"] == "stub::demo"
+    captured.clear()
+    build.pool("stub::demo")
+    assert captured == {}
 
 
 @pytest.mark.asyncio

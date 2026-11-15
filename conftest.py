@@ -36,6 +36,19 @@ for _path in reversed(_PATHS):
         sys.path.insert(0, _path)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cli_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """每个测试都用临时 ``LIORIUM_HOME``：绝不读写开发机上的 ``~/.liorium``。
+
+    2026-11-14 起 CLI 会**自动创建 / 迁移** ``profile.json``，任何走到配置路径的测试
+    都会污染真实家目录（曾经把开发机的 config.json 迁走）。需要指定位置的测试可以
+    在用例内部再 ``monkeypatch.setenv``，覆盖这里的默认值。
+    """
+    home = tmp_path / "liorium-home"
+    monkeypatch.setenv("LIORIUM_HOME", str(home))
+    return home
+
+
 @pytest.fixture
 def agent_workspace(tmp_path: Path) -> Path:
     """最小 Agent 工作区：AGENT.md / ROLE.md + 一个可读文件。"""

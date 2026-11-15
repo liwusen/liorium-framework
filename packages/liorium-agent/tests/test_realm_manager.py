@@ -206,11 +206,11 @@ async def test_set_enabled_toggles_single_realm(tmp_path: Path) -> None:
 
 
 def test_context_cadence_reads_params_override(tmp_path: Path) -> None:
-    """``context_every`` 的 ``RealmSpec.params`` 覆盖类属性；非法值按 0。"""
+    """``context_every`` 的 ``RealmSpec.config`` 覆盖类属性；非法值按 0。"""
     manager = build_manager(
         tmp_path,
         {"a": FakeRealm("a")},
-        specs=[RealmSpec(id="a", params={"context_every": 7})],
+        specs=[RealmSpec(id="a", config={"context_every": 7})],
     )
     assert manager.context_cadence("a") == 7  # 未 start() 也读 spec
 
@@ -222,7 +222,7 @@ async def test_context_cadence_same_before_and_after_start(tmp_path: Path) -> No
     manager = build_manager(
         tmp_path,
         {"a": FakeRealm("a")},
-        specs=[RealmSpec(id="a", params={"context_every": 3, "context_first": True})],
+        specs=[RealmSpec(id="a", config={"context_every": 3, "context_first": True})],
     )
     assert manager.context_cadence("a") == 3
     await manager.start_all()
@@ -482,7 +482,7 @@ async def test_realm_context_carries_params_state_and_agent_id(tmp_path: Path) -
     manager = build_manager(
         tmp_path,
         {"memory": realm},
-        specs=[RealmSpec(id="memory", params={"top_k": 5})],
+        specs=[RealmSpec(id="memory", config={"top_k": 5})],
     )
 
     await manager.start_all()
@@ -491,7 +491,7 @@ async def test_realm_context_carries_params_state_and_agent_id(tmp_path: Path) -
     assert ctx is not None
     assert ctx.realm_id == "memory"
     assert ctx.agent_id == "main"
-    assert ctx.params == {"top_k": 5}
+    assert ctx.config == {"top_k": 5}
     assert ctx.vfs is manager.vfs
     assert ctx.state.path == tmp_path / "memory.json"
 

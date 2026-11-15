@@ -58,11 +58,18 @@ class AgentStatus:
     running: bool = False
     turn_id: str | None = None
     queue_depth: int = 0
+    """Inbox 深度（所有待处理条目）。"""
     spec_fingerprint: str = ""
     epoch: CacheEpoch = field(default_factory=CacheEpoch)
     realms: tuple[RealmStatus, ...] = ()
     messages: int = 0
     pending_context: int = 0
+    """ContextChannel 里待物化的条数（不含 Inbox）。"""
+    pending_by_bucket: tuple[tuple[str, int], ...] = ()
+    """桶名 → 待处理条数（固定顺序：IMMEDIATE / MAJOR / BATCHED / ENVIRONMENT）。
+
+    供适配器闸门判断积压构成："该回的有几条、可丢的有几条"。
+    """
     started: bool = False
     closed: bool = False
 

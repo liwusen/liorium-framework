@@ -70,6 +70,7 @@ from .formats import (
     summarize_route_sources,
     supported_server_tools,
 )
+from .pool import ChatModelPool, ModelFactoryPort
 from .registry import ProviderRegistry, ResolvedModel
 from .schema import (
     DEFAULT_CONTEXT_LENGTH,
@@ -132,6 +133,7 @@ __all__ = [
     "ANTHROPIC_MIN_THINKING_BUDGET",
     "API_FORMATS",
     "CACHE_TTL_SECONDS",
+    "ChatModelPool",
     "DEFAULT_CACHE_PATH",
     "DEFAULT_CONTEXT_LENGTH",
     "DEFAULT_FORMAT",
@@ -163,6 +165,7 @@ __all__ = [
     "ThinkingCapability",
     "ThinkingOption",
     "ModelProvider",
+    "ModelFactoryPort",
     "ModelProviders",
     "build_chat_model",
     "build_chat_model_from_spec",

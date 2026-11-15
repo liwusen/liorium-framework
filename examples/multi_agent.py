@@ -2,8 +2,9 @@
 
 计划依据 §Phase 2「多 Agent 宿主示例（2 个 ``LioriumAgent`` + semaphore）」：
 
-- **Agent 本身没有"并发上限"这个概念**：`run()` 返回的就是这一条消息的事件流，
-  "同一时刻最多 N 个 Agent 在跑"由调用方用 semaphore 包住 `async for` 即可；
+- **Agent 本身没有"并发上限"这个概念**：`push()` 把消息投进入站队列，
+  `stream(ids=[...])` 观察这一条消息的回合；"同一时刻最多 N 个 Agent 在跑"由调用方
+  用 semaphore 包住"投递 + 收到终态帧"即可；
 - 两个 Agent 各自身份独立（自己的 inbox / checkpoint / prompt），共享同一份
   provider 配置与一个 semaphore；
 - 只用一个进程、一个事件循环：``asyncio.gather`` 并发跑，谁先拿到 semaphore 谁先说。
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import itertools
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -31,6 +33,10 @@ from liorium.cli.providers import (
 )
 from liorium.core.types import Event
 from liorium.core_tool_realm import CoreToolRealm
+
+_TERMINAL = frozenset({"done", "interrupted", "error"})
+_ENTRY_SEQ = itertools.count(1)
+"""示例自己的条目号（``push`` 的 id 必填，且是事件流的关联键）。"""
 
 ROLES: dict[str, str] = {
     "planner": (
@@ -81,6 +87,27 @@ def build_agents(
     return agents
 
 
+async def collect(agent: LioriumAgent, text: str) -> list[Event]:
+    """投递一条消息并收齐"这一回合"的事件（到终态帧为止）。
+
+    先 ``stream(ids=[entry_id])`` 再 ``push``：订阅发生在 ``__aiter__``，反过来会
+    漏帧。示例刻意不 import 测试工具箱，保持"可复制到宿主项目"的最小形态。
+    """
+    entry_id = f"multi:{agent.spec.id}:{next(_ENTRY_SEQ)}"
+    subscription = agent.stream(ids=[entry_id])
+    iterator = subscription.__aiter__()
+    events: list[Event] = []
+    try:
+        agent.push(text, id=entry_id)
+        while True:
+            event = await iterator.__anext__()
+            events.append(event)
+            if event.type in _TERMINAL:
+                return events
+    finally:
+        await subscription.aclose()
+
+
 async def run_agents(
     *,
     prompt: str,
@@ -111,11 +138,12 @@ async def run_agents(
     async def drain(agent: LioriumAgent) -> None:
         chunks: list[str] = []
         async with semaphore:
-            async for event in agent.run(prompt):
-                if event.type == "delta":
-                    chunks.append(str(event.get("content") or ""))
-                if emit is not None:
-                    emit(agent.spec.id, event)
+            events = await collect(agent, prompt)
+        for event in events:
+            if event.type == "delta":
+                chunks.append(str(event.get("content") or ""))
+            if emit is not None:
+                emit(agent.spec.id, event)
         outputs[agent.spec.id] = "".join(chunks)
 
     try:

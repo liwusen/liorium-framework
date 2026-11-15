@@ -5,7 +5,7 @@
 
 行为：
 
-- ``RealmSpec.params["servers"]`` 只写**要连哪些 server**（id → 配置）；
+- ``RealmSpec.config["servers"]`` 只写**要连哪些 server**（id → 配置）；
   工具在 ``start()`` 时发现，按 ``<server>_<tool>`` 暴露；
 - 单个 server 连不上 ⇒ 记 ``error``、跳过它，其它 server 的工照常可用（降级但可用）；
   所有 server 都连不上且 ``strict=True`` ⇒ realm 启动失败（由 RealmManager 标 failed）；

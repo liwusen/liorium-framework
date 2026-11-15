@@ -68,7 +68,7 @@ class BootSpec:
     """首次引导语。
 
     **库不自动执行**（计划 §F7 / §3.9）：``start()`` 绝不调模型；
-    宿主拿到这条消息后自己决定要不要 ``run(boot.message)``。
+    宿主拿到这条消息后自己决定要不要 ``push(boot.message, id=...)``。
     """
 
     message: str | None = None
@@ -76,78 +76,26 @@ class BootSpec:
 
 @dataclass(frozen=True)
 class RealmSpec:
-    """一个 realm 的声明。``params`` 进指纹，所以必须可序列化。"""
+    """一个 realm 的声明。``config`` 进指纹，所以必须可序列化。"""
 
     id: str
-    params: Mapping[str, Any] = field(default_factory=dict)
+    config: Mapping[str, Any] = field(default_factory=dict)
     requires: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.id:
             raise SpecError("RealmSpec.id 不能为空")
-        object.__setattr__(self, "params", dict(self.params))
+        object.__setattr__(self, "config", dict(self.config))
         object.__setattr__(self, "requires", tuple(self.requires))
         try:
-            fingerprint(self.params)
-        except TypeError as exc:  # 不可序列化参数会污染指纹
-            raise SpecError(f"realm {self.id!r} 的 params 不可序列化: {exc}") from exc
+            fingerprint(self.config)
+        except TypeError as exc:  # 不可序列化配置会污染指纹
+            raise SpecError(f"realm {self.id!r} 的 config 不可序列化: {exc}") from exc
 
-
-@dataclass(frozen=True)
-class Profile:
-    """profile 语法糖（计划 §C2 / §Phase 2）：一组可复用的 realm + prompt + toolset。
-
-    ``AgentSpec.with_profile(profile)`` 把三者**合并**进 spec，指纹覆盖合并结果，
-    所以"用 profile 装的"和"手写同一组 realm"是同一个装配（不会产生两套行为）。
-
-    合并规则（显式声明总是赢）：
-
-    - ``realms``：profile 的在前，spec 已有的按 id 覆盖 profile 里的同 id 项；
-    - ``prompt_sources``：profile 的在前，spec 追加，按出现顺序去重；
-    - ``toolsets``：同名 key 以 spec 为准。
-    """
-
-    id: str
-    realms: tuple[RealmSpec, ...] = ()
-    prompt_sources: tuple[str, ...] = ()
-    toolsets: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
-
-    def __post_init__(self) -> None:
-        if not self.id:
-            raise SpecError("Profile.id 不能为空")
-        object.__setattr__(self, "realms", tuple(self.realms))
-        object.__setattr__(self, "prompt_sources", tuple(str(p) for p in self.prompt_sources))
-        object.__setattr__(
-            self, "toolsets", {str(k): tuple(str(t) for t in v) for k, v in self.toolsets.items()}
-        )
-        seen: set[str] = set()
-        for realm in self.realms:
-            if not isinstance(realm, RealmSpec):
-                raise SpecError(f"profile {self.id!r} 的 realms 里出现非 RealmSpec: {realm!r}")
-            if realm.id in seen:
-                raise SpecError(f"profile {self.id!r} 里 realm id 重复: {realm.id!r}")
-            seen.add(realm.id)
-
-    def expand(self, spec: "AgentSpec") -> "AgentSpec":
-        """合并进 spec（不改原 spec）。"""
-        spec_realms = {r.id: r for r in spec.realms}
-        merged_realms = tuple(
-            spec_realms.get(r.id, r) for r in self.realms
-        ) + tuple(r for r in spec.realms if r.id not in {p.id for p in self.realms})
-        prompt_sources: list[str] = []
-        for source in (*self.prompt_sources, *spec.prompt_sources):
-            if source not in prompt_sources:
-                prompt_sources.append(source)
-        toolsets: dict[str, tuple[str, ...]] = {
-            **{k: tuple(v) for k, v in self.toolsets.items()},
-            **{k: tuple(v) for k, v in spec.toolsets.items()},
-        }
-        return replace(
-            spec,
-            realms=merged_realms,
-            prompt_sources=tuple(prompt_sources),
-            toolsets=toolsets,
-        )
+    @property
+    def params(self) -> Mapping[str, Any]:
+        """旧名只读别名（2026-11-14 起统一叫 ``config``）。"""
+        return self.config
 
 
 @dataclass(frozen=True)
@@ -246,11 +194,4 @@ class AgentSpec:
     def with_limits(self, limits: Limits) -> "AgentSpec":
         return replace(self, limits=limits)
 
-    def with_profile(self, profile: Profile) -> "AgentSpec":
-        """profile 语法糖：把 ``profile`` 合并进本 spec（见 ``Profile.expand``）。"""
-        if not isinstance(profile, Profile):
-            raise SpecError(f"with_profile 需要 Profile，收到 {type(profile).__name__}")
-        return profile.expand(self)
-
-
-__all__ = ["AgentSpec", "BootSpec", "Limits", "Profile", "RealmSpec"]
+__all__ = ["AgentSpec", "BootSpec", "Limits", "RealmSpec"]

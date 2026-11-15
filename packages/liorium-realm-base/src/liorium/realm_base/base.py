@@ -4,6 +4,17 @@
 另有两条可选节拍：``dirty()``（真相源变了，v1.1）与 ``context_items()``（周期上下文，
 第五拍，2026-11-07 起由 ``RealmManager`` 驱动，见 ``docs/design/realm-context.md``）。
 
+**主动推送**（2026-11-14）：``ctx.emit()`` 往事件流发一帧、``ctx.push()`` 投入站条目、
+``ctx.interrupt()`` 叫停回合、``ctx.turn`` 读当前回合 —— 由 ``RealmContext.host``
+（宿主端口，独立使用时为 ``None``）提供。
+
+**只读钩子**（2026-11-14）：``on_turn_start/end``、``on_model_start/end``、
+``on_tool_start/end`` 六个 ``async`` 通知方法。**没有 ``nxt()``、没有返回值、
+拿不到 ``ModelRequest``** —— realm 永远不能改写模型请求（写进契约，不是靠自觉）。
+
+**宿主消息**（2026-11-14）：宿主通过 ``agent.send_to_realm()`` 发来 :class:`RealmMessage`，
+realm 实现 ``on_message()`` 接收；默认实现抛错（没实现 = 不接受消息）。
+
 **实例作用域**（2026-11-08）：``instance_scope="agent"``（默认，每个 Agent 一份、
 状态落各自 inbox）或 ``"tree"``（整棵 Agent 树一份，持有挂载/外部连接的 realm 必须选它）。
 框架强制不变式：``agent`` 级 realm 不许返回挂载点 —— 见 :class:`BaseRealm`。
@@ -21,6 +32,7 @@ import asyncio
 import contextvars
 import json
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Protocol, Sequence, runtime_checkable
@@ -46,6 +58,68 @@ class ContextSink(Protocol):
     """
 
     def queue(self, items: Sequence[ContextItem]) -> None: ...
+
+
+@runtime_checkable
+class RealmHost(Protocol):
+    """``RealmContext.host`` 的落点：realm 主动"推"的四个动作。
+
+    刻意用**结构类型**（同 :class:`ContextSink`）：本包不许 import ``liorium.agent``，
+    而 Agent 侧的实现只需要这四个方法。装配进 Agent 时由 ``RealmManager`` 注入
+    （实现见 ``liorium.agent.realm.host``）；独立使用 ``RealmContext`` 时为 ``None``，
+    此时 ``emit`` 是空操作、``push`` / ``interrupt`` 抛 ``RealmError``。
+
+    **没有**任何"改请求"的方法，也不暴露 langchain 的 ``ModelRequest`` / ``ToolCallRequest``。
+    """
+
+    def emit(self, name: str, data: Mapping[str, Any]) -> None: ...
+
+    def push(
+        self,
+        text: str,
+        *,
+        bucket: str = "environment",
+        origin: str = "",
+        timeout: float | None = None,
+    ) -> str: ...
+
+    def interrupt(self, reason: str = "realm") -> bool: ...
+
+    def turn_info(self) -> "TurnInfo | None": ...
+
+
+@dataclass(frozen=True)
+class RealmMessage:
+    """宿主发给 realm 的一条消息（2026-11-14；``liorium.agent.send_to_realm`` 构造）。
+
+    与 :class:`TurnInfo` 的关系：消息**不属于任何回合**，它就是"外部程序说了一件事"。
+    两个典型用途（同一套机制）：
+
+    - 业务命令：``name="todo.add"``、``data={"text": "写 demo"}``，handler 返回结果；
+    - 领域事件：``name="webhook.changed"``、``data={...}``，handler 返回 ``None``，
+      自己决定 ``ctx.emit`` / ``ctx.inject`` / ``mark_dirty``。
+
+    ``data`` 是**浅拷贝副本**（宿主之后改自己的 dict 不影响这条消息）；字段冻结，
+    realm 想改就自己 ``dict(message.data)``。``name`` 去首尾空白后必须非空。
+    """
+
+    realm_id: str
+    """目标 realm（由框架填写，realm 不用猜）。"""
+    name: str
+    """消息名；约定 ``<领域>.<动作>``（``todo.add`` / ``mcp.servers_changed``）。"""
+    data: dict[str, Any] = field(default_factory=dict)
+    """载荷副本；必须是可浅拷贝的 mapping。"""
+    origin: str = "host"
+    """谁发的（``host`` / ``webui`` / ``cron`` / …），realm 可据此区分来源。"""
+
+    def __post_init__(self) -> None:
+        name = self.name.strip() if isinstance(self.name, str) else ""
+        if not name:
+            raise RealmError("RealmMessage 需要非空 name")
+        data = self.data if isinstance(self.data, Mapping) else {}
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "data", dict(data))
+        object.__setattr__(self, "origin", str(self.origin or "host"))
 
 
 class RealmTaskScope:
@@ -110,7 +184,8 @@ class RealmContext:
     realm_id: str
     vfs: "VirtualFileSystem"
     state: "JsonStateStore"
-    params: dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any] = field(default_factory=dict)
+    """realm 的配置（``RealmSpec.config``）：已由 profile 按类的 ``Config`` 校验并填默认。"""
     agent_id: str = ""
     inbox_dir: Path | None = None
     """Agent 的根目录（``AgentSpec.inbox_dir``）；能力包用它定位自己的数据（v1.1）。"""
@@ -130,10 +205,35 @@ class RealmContext:
     tasks: RealmTaskScope = field(default_factory=RealmTaskScope)
     context: "ContextSink | None" = None
     """Context 通道（由 ``RealmManager`` 注入；独立使用时为 ``None``）。"""
+    host: "RealmHost | None" = None
+    """宿主端口（由 ``RealmManager`` 注入）：``emit`` / ``push`` / ``interrupt`` / ``turn``。
+
+    独立使用（测试 / 不装进 Agent）时为 ``None``。
+    """
+    model_factory: Callable[[], Any] | None = None
+    """aux 模型工厂（零参）。``ctx.model`` 每次访问都通过它取**当前**模型。
+
+    为什么是工厂：realm 在 ``start()`` 时早于主模型构建，而 ``apply()`` 换模型后
+    不会重启 realm —— 固定实例必然过期。独立使用时为 ``None``（``ctx.model is None``）。
+    """
 
     @property
     def log(self):
         return get_logger(f"realm.{self.realm_id}")
+
+    @property
+    def model(self) -> Any:
+        """aux 模型（不思考、无工具，供抽取 / 摘要类调用）；独立使用时为 ``None``。
+
+        realm **不得** close 它：所有权在宿主 / ``ChatModelPool``。
+        """
+        factory = self.model_factory
+        return factory() if factory is not None else None
+
+    @property
+    def params(self) -> dict[str, Any]:
+        """旧名只读别名（2026-11-14 起统一叫 ``config``）。"""
+        return self.config
 
     def spawn(
         self,
@@ -184,6 +284,72 @@ class RealmContext:
         batch = list(items)
         if batch:
             self.context.queue(batch)
+
+    # ------------------------------------------------------------------
+    # 主动推送（2026-11-14）
+    # ------------------------------------------------------------------
+
+    def emit(self, name: str, data: Mapping[str, Any] | None = None) -> None:
+        """往事件流推一帧 ``realm``（同步、不阻塞、永不打断、**不开回合**）。
+
+        没有宿主时**静默返回**：事件是广播，没人听就不发 —— 这样"可选通知"
+        不用在 realm 里到处判空。事件名 / 数据校验失败仍然抛错（那是 bug）。
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise RealmError(f"realm {self.realm_id!r} 的 emit() 需要非空事件名")
+        if self.host is None:
+            return
+        self.host.emit(name.strip(), dict(data or {}))
+
+    def push(
+        self,
+        text: str,
+        *,
+        bucket: str = "environment",
+        origin: str | None = None,
+        timeout: float | None = None,
+    ) -> str:
+        """投一条入站条目，返回条目 id（``realm:<realm_id>:<n>``）。
+
+        ``bucket`` 默认 ``"environment"``：**永不开回合**，参与 ``env_interval`` 节流；
+        显式传 ``"major"`` / ``"batched"`` / ``"immediate"`` 才会开回合 / 抢回合
+        （``liorium.agent.Bucket`` 是 ``str`` 枚举，直接传枚举实例也认）。
+
+        ``timeout`` 是消费截止时间（秒），过期的条目不会物化。
+        没有宿主时抛 ``RealmError``：它会改变 Agent 行为，静默失败比报错更糟。
+        """
+        if not isinstance(text, str) or not text.strip():
+            raise RealmError(f"realm {self.realm_id!r} 的 push() 需要非空文本")
+        if self.host is None:
+            raise RealmError(
+                f"realm {self.realm_id!r} 没有宿主端口（push 不可用；独立使用 RealmContext 时）"
+            )
+        return self.host.push(
+            text,
+            bucket=bucket,
+            origin=origin or f"realm:{self.realm_id}",
+            timeout=timeout,
+        )
+
+    def interrupt(self, reason: str = "realm") -> bool:
+        """叫停当前回合（同步）；返回是否真的打断了回合。
+
+        从工具内部调用会连带取消**正在执行它**的那个回合任务：调用点在下一个
+        ``await`` 收到 ``CancelledError``，回合以 ``interrupted(reason)`` 收尾。
+        没有宿主时抛 ``RealmError``。
+        """
+        if self.host is None:
+            raise RealmError(
+                f"realm {self.realm_id!r} 没有宿主端口（interrupt 不可用；独立使用 RealmContext 时）"
+            )
+        return self.host.interrupt(reason or "realm")
+
+    @property
+    def turn(self) -> "TurnInfo | None":
+        """当前回合身份；没有回合在跑（或没有宿主）时为 ``None``。"""
+        if self.host is None:
+            return None
+        return self.host.turn_info()
 
 
 class JsonStateStore:
@@ -269,6 +435,58 @@ class TurnInfo:
     origin: str = "user"
 
 
+# ---------------------------------------------------------------------------
+# 只读钩子的入参（2026-11-14）
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelCall:
+    """一次模型调用的**只读快照**（``on_model_start`` / ``on_model_end`` 的入参）。
+
+    没有 langchain 的 ``ModelRequest``：能拿到它就能 ``override``，那就等于开了改写后门。
+    """
+
+    turn: TurnInfo | None
+    model: str
+    """模型标签（``AgentSpec.model``）。"""
+    messages: tuple[Any, ...]
+    """本次请求的消息快照（含 system）。tuple，改不动。"""
+    index: int = 0
+    """本回合第几次模型调用（从 1 开始；``0`` = 未知）。"""
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    """一次工具调用的**只读快照**（``on_tool_start`` / ``on_tool_end`` 的入参）。"""
+
+    turn: TurnInfo | None
+    name: str
+    args: Mapping[str, Any]
+    """``MappingProxyType``：只读视图。"""
+    call_id: str = ""
+
+
+@dataclass(frozen=True)
+class HookOutcome:
+    """模型调用 / 工具执行的结局（失败也走 ``on_*_end``，此时 ``ok=False``）。"""
+
+    ok: bool
+    error: str | None = None
+    """``"类名: 消息"``，不带 traceback。"""
+    elapsed_ms: int = 0
+
+
+@dataclass(frozen=True)
+class TurnOutcome:
+    """回合的结局（``on_turn_end`` 的入参）；取消路径不保证收到。"""
+
+    kind: str
+    """``"done"`` / ``"error"`` / ``"interrupted"``。"""
+    error: str | None = None
+    elapsed_ms: int = 0
+
+
 @runtime_checkable
 class Realm(Protocol):
     """realm 协议（计划 §3.3）。
@@ -284,6 +502,10 @@ class Realm(Protocol):
     - ``dirty()`` / ``mark_dirty()``：运行期真相源变了（MCP 发现新工具、装了技能），
       由 Agent 在**回合边界**刷新工具/挂载/提示词，而不是让宿主记得重建；
     - ``skills()``：该 realm 想预载进 system prompt「技能清单」段的条目。
+
+    2026-11-14 追加六个**只读**钩子（全部可选）：``on_turn_start/end``、
+    ``on_model_start/end``、``on_tool_start/end``。没有 ``nxt()``、没有返回值、
+    拿不到 ``ModelRequest`` —— realm **不能改写模型请求**。
     """
 
     id: str
@@ -347,7 +569,7 @@ class BaseRealm:
 
     # -- 第五拍：周期上下文（声明；节拍器由 RealmManager 驱动，见 docs/design/realm-context.md）--
     context_every: int = 0
-    """每 N 个回合给一次注入机会；``0`` = 不参与（默认）。``RealmSpec.params`` 可覆盖。"""
+    """每 N 个回合给一次注入机会；``0`` = 不参与（默认）。``RealmSpec.config`` 可覆盖。"""
     context_first: bool = False
     """``True``：第 1 回合先注入一次，再进入 ``context_every`` 的节奏。"""
     context_origins: tuple[str, ...] = ()
@@ -355,7 +577,11 @@ class BaseRealm:
 
     def __init__(self, spec: Any = None) -> None:
         self.spec = spec
-        self.params: dict[str, Any] = dict(getattr(spec, "params", {}) or {})
+        raw = getattr(spec, "config", None)
+        if raw is None:  # 兼容只实现旧名 ``params`` 的自定义 spec
+            raw = getattr(spec, "params", {})
+        self.config: dict[str, Any] = dict(raw or {})
+        self.params = self.config
         self.ctx: RealmContext | None = None
         self.log = get_logger(f"realm.{self.id or type(self).__name__}")
 
@@ -433,6 +659,59 @@ class BaseRealm:
         """
         return None
 
+    # ------------------------------------------------------------------
+    # 宿主消息（2026-11-14）：宿主 → realm 的唯一入口
+    # ------------------------------------------------------------------
+
+    async def on_message(self, message: RealmMessage) -> Any:
+        """宿主通过 ``agent.send_to_realm()`` 发来一条消息；返回值原样回给宿主。
+
+        默认实现**抛错**：没实现这个方法的 realm 不接受消息，静默丢一条外部指令比报错
+        更糟。可 sync 可 async；里面可以正常用 ``self.ctx`` 的一切（``emit`` / ``push`` /
+        ``interrupt`` / ``inject`` / ``state`` / ``save`` / ``spawn``）。
+
+        约束（写进契约，不是建议）：
+
+        - 处理**在调用方的 task 里立即执行**，与回合并发 ⇒ 慢活自己 ``ctx.spawn``；
+        - **不要**在里调 ``refresh_realms`` / ``set_realm_enabled`` / ``reset_dialog`` /
+          ``close``（框架会抛 ``TurnError``：它们要维护队列，而你正持着 realm 锁）；
+        - **不要**向同一个 realm 递归 ``send_to_realm``（自锁）；
+        - 消息**不属于任何回合**：``ctx.turn`` 读到的可能是别人正在跑的回合。
+        """
+        raise RealmError(
+            f"realm {self.id or type(self).__name__!r} 不接受消息（没有实现 on_message）"
+        )
+
+    # ------------------------------------------------------------------
+    # 只读钩子（2026-11-14）：六个 on_*，没有 nxt()、没有返回值
+    # ------------------------------------------------------------------
+
+    async def on_turn_start(self, turn: TurnInfo) -> None:
+        """回合开始（``start`` 帧之后、第一次模型调用之前）。
+
+        可以 ``ctx.emit`` / ``ctx.inject`` / ``ctx.push`` —— 它们影响的是**之后**
+        （下一条帧、下一条消息、下一个回合），不是正在发生的这次调用。
+        """
+
+    async def on_turn_end(self, turn: TurnInfo, outcome: TurnOutcome) -> None:
+        """回合收尾（**终态帧之前**）。
+
+        取消路径（``interrupt`` / ``close``）不保证调用：任务已被取消，
+        在 ``CancelledError`` 里 ``await`` 钩子会立刻再被取消。
+        """
+
+    async def on_model_start(self, call: ModelCall) -> None:
+        """每次模型调用之前（拿到的是只读快照）。"""
+
+    async def on_model_end(self, call: ModelCall, outcome: HookOutcome) -> None:
+        """每次模型调用之后；失败也调用（``outcome.ok is False``）。"""
+
+    async def on_tool_start(self, call: ToolCall) -> None:
+        """每次工具执行之前。"""
+
+    async def on_tool_end(self, call: ToolCall, outcome: HookOutcome) -> None:
+        """每次工具执行之后；失败也调用（``outcome.ok is False``）。"""
+
     def __repr__(self) -> str:
         return f"<{type(self).__name__} id={self.id!r}>"
 
@@ -453,6 +732,13 @@ class RealmRecord:
     """第五拍倒计时（``None`` = 还没从 state 读回；0 = 本回合就该问）。"""
     context_injections: int = 0
     """本进程内成功注入次数（只用于 ``status()`` 观测，不落盘）。"""
+    send_lock: Any = field(default_factory=asyncio.Lock, repr=False, compare=False)
+    """宿主消息与生命周期互斥（2026-11-14）。
+
+    同一个 realm 的 ``send()`` / ``start()`` / ``stop()`` 共用这把锁：消息彼此串行，
+    且 ``stop`` 会等手上那条消息跑完。树级 realm 的 record 是**同一个对象**（根 manager
+    的那条），所以子 Agent 与根共享同一把锁 —— 这是"转发给树根"的并发侧保证。
+    """
 
     @property
     def id(self) -> str:
@@ -463,15 +749,33 @@ def utc_stamp() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
 
 
+def overrides_hook(instance: Any, name: str) -> bool:
+    """``instance`` 是否覆盖了 ``BaseRealm`` 的某个可选方法（钩子 / 第五拍共用）。
+
+    ``BaseRealm`` 的默认实现是空转；只有真的覆盖了才值得装适配器、才值得每回合回调。
+    非 ``BaseRealm`` 的 realm（鸭子类型）只要自己定义了同名方法也算覆盖。
+    """
+    own = getattr(type(instance), name, None)
+    base = getattr(BaseRealm, name, None)
+    return callable(own) and own is not base
+
+
 __all__ = [
     "BaseRealm",
     "ContextSink",
+    "HookOutcome",
     "JsonStateStore",
+    "ModelCall",
     "Realm",
     "RealmContext",
+    "RealmHost",
+    "RealmMessage",
     "RealmRecord",
     "RealmTaskScope",
+    "ToolCall",
     "TurnInfo",
+    "TurnOutcome",
+    "overrides_hook",
     "realm_tool",
     "utc_stamp",
 ]

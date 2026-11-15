@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import sys
@@ -36,7 +37,10 @@ from liorium.provider import (
 from liorium.provider.schema import dumps as dumps_providers
 from liorium.provider.schema import loads as loads_providers
 
+from liorium.profile import AgentProfile, ProfileError
+
 from . import config as cfg
+from . import profile as prof
 from .config import ConfigError
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
@@ -53,18 +57,17 @@ PROVIDER_THINKING_DIALECTS = (
 )
 
 MEMORY_SHORTCUTS = {
-    "enabled": "memory.enabled",
-    "dir": "memory.dir",
-    "embed-model": "memory.embed_model",
-    "embed_model": "memory.embed_model",
-    "embed-base-url": "memory.embed_base_url",
-    "embed_base_url": "memory.embed_base_url",
-    "embed-key": "memory.embed_key",
-    "embed_key": "memory.embed_key",
-    "vectors": "memory.vectors",
-    "extraction": "memory.extraction",
+    "enabled": "enabled",
+    "dir": "dir",
+    "embed-model": "embed_model",
+    "embed_model": "embed_model",
+    "embed-base-url": "embed_base_url",
+    "embed_base_url": "embed_base_url",
+    "embed-key": "embed_key",
+    "embed_key": "embed_key",
+    "vectors": "vectors",
+    "extraction": "extraction",
 }
-
 
 # ---------------------------------------------------------------------------
 # 上下文
@@ -77,6 +80,7 @@ class Ctx:
 
     providers: Path
     config_file: Path
+    profile: Path | None = None
     input_fn: Callable[[str], str] = input
     print_fn: Callable[[str], None] = print
     json_mode: bool = False
@@ -95,6 +99,19 @@ class Ctx:
     def save_config(self, config: Mapping[str, Any]) -> Path:
         return cfg.save_config(config, self.config_file)
 
+    def profile_path(self) -> Path:
+        return Path(self.profile) if self.profile else prof.resolve_profile_path()
+
+    def load_profile(self) -> dict[str, Any]:
+        """profile 原始 JSON（不存在时给默认模板；不校验，校验交给 AgentProfile.load）。"""
+        target = self.profile_path()
+        return prof.load_raw(target) if target.is_file() else prof.default_profile(
+            provider_file=str(self.providers)
+        )
+
+    def save_profile(self, data: Mapping[str, Any]) -> Path:
+        return prof.save_raw(self.profile_path(), data)
+
     def emit_json(self, payload: Any) -> None:
         self.out(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
@@ -104,6 +121,7 @@ def make_ctx(
     home: Path | str | None = None,
     config_file: Path | str | None = None,
     providers: Path | str | None = None,
+    profile: Path | str | None = None,
     input_fn: Callable[[str], str] = input,
     print_fn: Callable[[str], None] = print,
     json_mode: bool = False,
@@ -118,6 +136,7 @@ def make_ctx(
     return Ctx(
         providers=cfg.providers_path(),
         config_file=cfg.config_path(),
+        profile=Path(profile).expanduser() if profile is not None else None,
         input_fn=input_fn,
         print_fn=print_fn,
         json_mode=json_mode,
@@ -739,76 +758,112 @@ def providers_set_key(ctx: Ctx, name: str, key: str | None = None) -> int:
 # ---------------------------------------------------------------------------
 
 
-def memory_dir_of(config: Mapping[str, Any]) -> Path | None:
-    raw = cfg.get_value(config, "memory.dir")
-    if not raw:
-        return None
-    return Path(str(raw)).expanduser()
+def _realm_config(data: Mapping[str, Any], realm_id: str) -> dict[str, Any]:
+    entry = prof.find_realm(dict(data), realm_id)
+    if entry is None:
+        return {}
+    config = entry.get("config")
+    return dict(config) if isinstance(config, Mapping) else {}
+
+
+def memory_dir_of(ctx: Ctx, data: Mapping[str, Any] | None = None) -> Path | None:
+    raw = _realm_config(data if data is not None else ctx.load_profile(), "memory").get("dir")
+    return Path(str(raw)).expanduser() if raw else None
+
+
+def profile_workspace(data: Mapping[str, Any]) -> Path:
+    raw = data.get("workspace")
+    if raw:
+        path = Path(str(raw)).expanduser()
+        return path if path.is_absolute() else (Path.cwd() / path).resolve()
+    return Path.cwd().resolve()
 
 
 def effective_inbox(
-    config: Mapping[str, Any],
+    data: Mapping[str, Any],
     *,
     workspace: Path | None = None,
     default: Path | None = None,
 ) -> Path:
-    raw = cfg.get_value(config, "inbox")
-    if raw:
-        return Path(str(raw)).expanduser()
     if default is not None:
         return Path(default)
-    root = workspace or Path.cwd()
-    return Path(root) / ".liorium-cli" / "agent"
+    root = Path(workspace) if workspace is not None else profile_workspace(data)
+    raw = data.get("inbox")
+    if raw:
+        path = Path(str(raw)).expanduser()
+        return path if path.is_absolute() else root / path
+    return root / ".liorium-cli" / "agent"
+
+
+def _inbox_of(ctx: Ctx, data: Mapping[str, Any]) -> Path:
+    """生效的 Agent 根目录：宿主给了就用宿主的（会话内 /setup），否则按 profile / 当前目录推。"""
+    return Path(ctx.inbox) if ctx.inbox is not None else effective_inbox(data)
 
 
 def effective_memory_dir(
-    config: Mapping[str, Any], *, inbox: Path | None = None
+    data: Mapping[str, Any], *, inbox: Path | None = None
 ) -> Path:
-    configured = memory_dir_of(config)
-    if configured is not None:
-        return configured
-    return effective_inbox(config) / "memory" if inbox is None else inbox / "memory"
+    base = Path(inbox) if inbox is not None else effective_inbox(data)
+    raw = _realm_config(data, "memory").get("dir")
+    if raw:
+        path = Path(str(raw)).expanduser()
+        return path if path.is_absolute() else base / path
+    return base / "memory"
 
 
 def effective_skills_dir(
-    config: Mapping[str, Any], *, inbox: Path | None = None
+    data: Mapping[str, Any], *, inbox: Path | None = None
 ) -> Path:
-    raw = cfg.get_value(config, "skills.dir")
+    base = Path(inbox) if inbox is not None else effective_inbox(data)
+    raw = _realm_config(data, "skills").get("skills_dir")
     if raw:
-        return Path(str(raw)).expanduser()
-    return effective_inbox(config) / "skill.d" if inbox is None else inbox / "skill.d"
+        path = Path(str(raw)).expanduser()
+        return path if path.is_absolute() else base / path
+    return base / "skill.d"
 
 
-def _inbox_of(ctx: Ctx, config: Mapping[str, Any]) -> Path:
-    """生效的 Agent 根目录：宿主给了就用宿主的（会话内 /setup），否则按配置/当前目录推。"""
-    return effective_inbox(config, default=ctx.inbox)
+def memory_dir_for(ctx: Ctx, data: Mapping[str, Any]) -> Path:
+    return effective_memory_dir(data, inbox=_inbox_of(ctx, data))
 
 
-def memory_dir_for(ctx: Ctx, config: Mapping[str, Any]) -> Path:
-    return effective_memory_dir(config, inbox=_inbox_of(ctx, config))
+def skills_dir_for(ctx: Ctx, data: Mapping[str, Any]) -> Path:
+    return effective_skills_dir(data, inbox=_inbox_of(ctx, data))
 
 
-def skills_dir_for(ctx: Ctx, config: Mapping[str, Any]) -> Path:
-    return effective_skills_dir(config, inbox=_inbox_of(ctx, config))
+def memory_settings(ctx: Ctx, data: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    payload = data if data is not None else ctx.load_profile()
+    entry = prof.find_realm(dict(payload), "memory")
+    config = _realm_config(payload, "memory")
+    embed = config.get("embed")
+    embed = dict(embed) if isinstance(embed, Mapping) else {}
+    return {
+        "enabled": entry is not None,
+        "dir": config.get("dir"),
+        "embed_model": str(embed.get("model") or ""),
+        "embed_base_url": str(embed.get("base_url") or ""),
+        "embed_key": str(embed.get("api_key") or ""),
+        "vectors": bool(config.get("vectors", True)),
+        "extraction": bool(config.get("extraction", True)),
+    }
 
 
 def memory_show(ctx: Ctx) -> int:
-    config = ctx.load_config()
-    directory = memory_dir_for(ctx, config)
-    configured = memory_dir_of(config)
+    data = ctx.load_profile()
+    settings = memory_settings(ctx, data)
+    directory = memory_dir_for(ctx, data)
     store = directory / "memory.sqlite"
     payload = {
-        "enabled": bool(cfg.get_value(config, "memory.enabled", True)),
+        "enabled": settings["enabled"],
         "dir": str(directory),
-        "dir_configured": str(configured) if configured else None,
+        "dir_configured": settings["dir"],
         "store_exists": store.is_file(),
         "store_bytes": store.stat().st_size if store.is_file() else 0,
-        "embed_model": cfg.get_value(config, "memory.embed_model", "") or "",
-        "embed_base_url": cfg.get_value(config, "memory.embed_base_url", "") or "",
-        "embed_key": cfg.mask_secret(cfg.get_value(config, "memory.embed_key", "")),
-        "vectors": bool(cfg.get_value(config, "memory.vectors", True)),
-        "extraction": bool(cfg.get_value(config, "memory.extraction", True)),
-        "file": str(ctx.config_file),
+        "embed_model": settings["embed_model"],
+        "embed_base_url": settings["embed_base_url"],
+        "embed_key": cfg.mask_secret(settings["embed_key"]),
+        "vectors": settings["vectors"],
+        "extraction": settings["extraction"],
+        "file": str(ctx.profile_path()),
     }
     if ctx.json_mode:
         ctx.emit_json(payload)
@@ -817,10 +872,10 @@ def memory_show(ctx: Ctx) -> int:
         ctx,
         [
             ("开关", "开" if payload["enabled"] else "关"),
-            ("目录", payload["dir"] + ("（默认）" if configured is None else "（已配置）")),
+            ("目录", payload["dir"] + ("（默认）" if settings["dir"] is None else "（已配置）")),
             ("记忆库", f"{store}（{'已存在' if payload['store_exists'] else '还没建'}）"),
             ("embed", payload["embed_model"] or "（未设置：只跑关键词检索）"),
-            ("embed 地址", payload["embed_base_url"] or "（跟随 provider）"),
+            ("embed 地址", payload["embed_base_url"] or "（未设置）"),
             ("embed key", payload["embed_key"]),
             ("向量索引", "开" if payload["vectors"] else "关"),
             ("实体抽取", "开" if payload["extraction"] else "关"),
@@ -831,28 +886,63 @@ def memory_show(ctx: Ctx) -> int:
 
 
 def memory_set(ctx: Ctx, key: str, value: str) -> int:
-    _ensure_files(ctx)
-    full = MEMORY_SHORTCUTS.get(str(key).strip().lower(), str(key).strip())
-    if not full.startswith("memory."):
+    token = MEMORY_SHORTCUTS.get(str(key).strip().lower())
+    if token is None:
         raise ConfigError(
             "用法: setup memory set <dir|embed-model|embed-base-url|embed-key"
             "|vectors|extraction|enabled> <值>"
         )
-    config = ctx.load_config()
-    parsed = cfg.set_value(config, full, value)
-    ctx.save_config(config)
-    if ctx.json_mode:
-        ctx.emit_json({full: parsed})
+    data = ctx.load_profile()
+    if token == "enabled":
+        enabled = cfg.coerce_bool(value, "memory.enabled")
+        prof.set_realm_enabled(data, "memory", enabled, prof.MEMORY_REALM)
+        ctx.save_profile(data)
+        if ctx.json_mode:
+            ctx.emit_json({"memory.enabled": enabled})
+            return 0
+        _ok(ctx, f"memory.enabled = {'开' if enabled else '关'}")
         return 0
-    _ok(ctx, f"{full} = {cfg.describe_value(full, parsed)}")
+
+    prof.ensure_realm(data, "memory", prof.MEMORY_REALM)
+    config = prof.realm_config(data, "memory")
+    if token == "dir":
+        text = str(value).strip()
+        if text:
+            config["dir"] = text
+        else:
+            config.pop("dir", None)
+        shown: Any = text or "(默认)"
+    elif token in ("vectors", "extraction"):
+        parsed = cfg.coerce_bool(value, f"memory.{token}")
+        config[token] = parsed
+        shown = "开" if parsed else "关"
+    else:
+        field = token.split("_", 1)[1]  # model / base_url / key
+        embed = dict(config.get("embed") or {})
+        text = str(value).strip()
+        if field == "model" and not text:
+            config.pop("embed", None)
+            shown = "(关闭语义检索)"
+        else:
+            embed[field] = text
+            embed.setdefault("model", "")
+            if field == "model":
+                embed.setdefault("base_url", "https://api.openai.com/v1")
+            embed.setdefault("api_key", "")
+            config["embed"] = embed
+            shown = cfg.mask_secret(text) if field == "key" else text or "(空)"
+    ctx.save_profile(data)
+    if ctx.json_mode:
+        ctx.emit_json({f"memory.{token}": shown})
+        return 0
+    _ok(ctx, f"memory.{token} = {shown}")
     return 0
 
 
 def memory_enable(ctx: Ctx, enabled: bool = True) -> int:
-    _ensure_files(ctx)
-    config = ctx.load_config()
-    cfg.set_value(config, "memory.enabled", enabled)
-    ctx.save_config(config)
+    data = ctx.load_profile()
+    prof.set_realm_enabled(data, "memory", enabled, prof.MEMORY_REALM)
+    ctx.save_profile(data)
     if ctx.json_mode:
         ctx.emit_json({"memory.enabled": enabled})
         return 0
@@ -861,7 +951,7 @@ def memory_enable(ctx: Ctx, enabled: bool = True) -> int:
 
 
 def memory_path(ctx: Ctx) -> int:
-    directory = memory_dir_for(ctx, ctx.load_config())
+    directory = memory_dir_for(ctx, ctx.load_profile())
     if ctx.json_mode:
         ctx.emit_json({"dir": str(directory)})
         return 0
@@ -869,26 +959,8 @@ def memory_path(ctx: Ctx) -> int:
     return 0
 
 
-def memory_init(ctx: Ctx, directory: str | Path | None = None) -> int:
-    _ensure_files(ctx)
-    config = ctx.load_config()
-    if directory is not None:
-        cfg.set_value(config, "memory.dir", str(Path(directory).expanduser()))
-        ctx.save_config(config)
-    target = memory_dir_for(ctx, config)
-    target.mkdir(parents=True, exist_ok=True)
-    (target / "content").mkdir(parents=True, exist_ok=True)
-    store_state = _init_store(target)
-    if ctx.json_mode:
-        ctx.emit_json({"dir": str(target), "store": store_state})
-        return 0
-    _ok(ctx, f"记忆目录已就绪: {target}")
-    ctx.out(f"  {store_state}")
-    return 0
-
-
 def _init_store(directory: Path) -> str:
-    """尽力把 ``memory.sqlite`` 建出来；缺 [vector] 之类的依赖不影响目录创建。"""
+    """尽力把 ``memory.sqlite`` 建出来；缺 ``[vector]`` 之类的依赖不影响目录创建。"""
     store = Path(directory) / "memory.sqlite"
     if store.is_file():
         return f"记忆库已存在: {store}"
@@ -902,6 +974,206 @@ def _init_store(directory: Path) -> str:
     return f"已初始化记忆库: {store}"
 
 
+def memory_init(ctx: Ctx, directory: str | Path | None = None) -> int:
+    data = ctx.load_profile()
+    if directory is not None:
+        prof.ensure_realm(data, "memory", prof.MEMORY_REALM)
+        prof.realm_config(data, "memory")["dir"] = str(Path(directory).expanduser())
+        ctx.save_profile(data)
+        data = ctx.load_profile()
+    target = memory_dir_for(ctx, data)
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "content").mkdir(parents=True, exist_ok=True)
+    store_state = _init_store(target)
+    if ctx.json_mode:
+        ctx.emit_json({"dir": str(target), "store": store_state})
+        return 0
+    _ok(ctx, f"记忆目录已就绪: {target}")
+    ctx.out(f"  {store_state}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# profile（Agent 装配）
+# ---------------------------------------------------------------------------
+
+
+def profile_show(ctx: Ctx) -> int:
+    """填好默认值再打印；``embed.api_key`` 打码（G6）。"""
+    target = ctx.profile_path()
+    raw = ctx.load_profile()
+    filled = copy.deepcopy(prof.default_profile(provider_file=str(ctx.providers)))
+    filled.update(copy.deepcopy(raw))
+    shown = copy.deepcopy(filled)
+    for entry in shown.get("realms") or []:
+        config = entry.get("config") if isinstance(entry, dict) else None
+        embed = config.get("embed") if isinstance(config, dict) else None
+        if isinstance(embed, dict) and embed.get("api_key"):
+            embed["api_key"] = cfg.mask_secret(embed["api_key"])
+
+    status: bool | str = True
+    if target.is_file():
+        try:
+            AgentProfile.load(target)
+        except Exception as exc:  # noqa: BLE001 - profile 会执行代码，错误要完整显示
+            status = str(exc)
+    else:
+        status = "还没建（首次启动会生成）"
+
+    payload = {
+        "path": str(target),
+        "exists": target.is_file(),
+        "valid": status,
+        "profile": shown,
+    }
+    if ctx.json_mode:
+        ctx.emit_json(payload)
+        return 0
+    _kv(
+        ctx,
+        [
+            ("路径", payload["path"]),
+            ("状态", "校验通过" if status is True else str(status)),
+        ],
+    )
+    ctx.out("")
+    ctx.out(json.dumps(shown, ensure_ascii=False, indent=2))
+    return 0
+
+
+def profile_path(ctx: Ctx) -> int:
+    target = ctx.profile_path()
+    if ctx.json_mode:
+        ctx.emit_json({"profile": str(target), "exists": target.is_file()})
+    else:
+        ctx.out(str(target))
+    return 0
+
+
+def profile_init(ctx: Ctx, *, template: str | None = None, force: bool = False) -> int:
+    """生成默认 profile；已存在时默认不覆盖（``--force`` 才重写）。"""
+    target = ctx.profile_path()
+    if target.is_file() and not force:
+        _warn(ctx, f"profile 已存在，没覆盖: {target}")
+        ctx.out("  要重新生成：setup profile init --force（原文件会被替换）")
+        return 0
+    payload: dict[str, Any]
+    if template:
+        source = Path(template).expanduser()
+        payload = dict(prof.load_raw(source))
+    else:
+        payload = prof.default_profile(
+            provider_file=str(Path(ctx.providers).expanduser().resolve())
+        )
+    path = prof.save_raw(target, payload)
+    if ctx.json_mode:
+        ctx.emit_json({"profile": str(path)})
+        return 0
+    _ok(ctx, f"已写入 profile: {path}")
+    ctx.out("  下一步: setup profile show / setup profile validate")
+    return 0
+
+
+def profile_validate(ctx: Ctx, *, schema_only: bool = False, provider: bool = False) -> int:
+    """校验 profile；默认等价运行期 ``load()``（含导入 realm、执行代码）。"""
+    target = ctx.profile_path()
+    if not target.is_file():
+        _fail(ctx, f"profile 不存在: {target}")
+        ctx.out("  先生成：setup profile init")
+        return 2
+    try:
+        if schema_only:
+            AgentProfile.model_validate(prof.load_raw(target))
+        else:
+            AgentProfile.load(target)
+    except Exception as exc:  # noqa: BLE001 - 校验失败要把原始错误完整展示
+        _fail(ctx, f"profile 不合法: {type(exc).__name__}: {exc}")
+        return 2
+    checks: list[str] = ["结构"] if schema_only else ["结构", "realm 导入", "Config"]
+    if provider:
+        raw = prof.load_raw(target)
+        provider_file = raw.get("provider_file")
+        if not provider_file:
+            _fail(ctx, "profile 没有 provider_file，无法校验 provider")
+            return 2
+        path = Path(str(provider_file)).expanduser()
+        if not path.is_absolute():
+            path = target.parent / path
+        try:
+            ProviderRegistry.load(path)
+        except ProviderConfigError as exc:
+            _fail(ctx, f"provider 配置不可用: {path}（{exc}）")
+            return 2
+        checks.append("provider")
+    if ctx.json_mode:
+        ctx.emit_json({"profile": str(target), "ok": True, "checks": checks})
+        return 0
+    _ok(ctx, f"profile 通过校验（{', '.join(checks)}）: {target}")
+    if schema_only:
+        ctx.out("  注意：--schema-only 不导入 realm，也不执行文件型 realm 的代码")
+    return 0
+
+
+def profile_edit(ctx: Ctx) -> int:
+    """用 ``$EDITOR`` 打开 profile；没有编辑器就只打印路径。"""
+    target = ctx.profile_path()
+    if not target.is_file():
+        _fail(ctx, f"profile 不存在: {target}")
+        ctx.out("  先生成：setup profile init")
+        return 2
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if not editor:
+        ctx.out(str(target))
+        ctx.out("  没设 $EDITOR；直接改这个文件，然后用 setup profile validate 校验")
+        return 0
+    ctx.out(str(target))
+    try:
+        import subprocess
+
+        subprocess.run([editor, str(target)], check=False)  # noqa: S603 - 用户自己的编辑器
+    except OSError as exc:
+        _fail(ctx, f"打不开编辑器 {editor!r}: {exc}")
+        ctx.out(f"  直接改这个文件: {target}")
+        return 2
+    return 0
+
+
+def profile_migrate(ctx: Ctx) -> int:
+    """手动触发 ``config.json`` → profile 的迁移（一次性）。"""
+    target = ctx.profile_path()
+    if target.is_file():
+        _warn(ctx, f"profile 已存在，跳过迁移: {target}")
+        return 1
+    try:
+        providers = read_providers(ctx)
+        registry = ProviderRegistry(providers) if providers.providers else None
+        resolved = registry.resolve(registry.default_label()) if registry is not None else None
+    except (ConfigError, ProviderConfigError):
+        resolved = None
+    try:
+        moved = prof.migrate_to_profile(
+            config_path=ctx.config_file,
+            profile_path=target,
+            provider_file=str(Path(ctx.providers).expanduser().resolve()),
+            provider_base_url=str(getattr(resolved, "base_url", "") or ""),
+            provider_key=str(getattr(getattr(resolved, "provider", None), "key", "") or ""),
+        )
+    except ConfigError as exc:
+        _fail(ctx, str(exc))
+        return 2
+    if moved is None:
+        _warn(ctx, "没有需要迁移的配置（config.json 里只有 UI 偏好或文件不存在）")
+        return 1
+    backup = Path(ctx.config_file).with_suffix(Path(ctx.config_file).suffix + ".bak")
+    if ctx.json_mode:
+        ctx.emit_json({"profile": str(moved), "backup": str(backup)})
+        return 0
+    _ok(ctx, f"已迁移到 profile: {moved}")
+    ctx.out(f"  备份: {backup}")
+    ctx.out(f"  config.json 已重写成 UI-only: {ctx.config_file}")
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # 总览 / 体检
 # ---------------------------------------------------------------------------
@@ -909,23 +1181,33 @@ def _init_store(directory: Path) -> str:
 
 def overview(ctx: Ctx) -> dict[str, Any]:
     config = ctx.load_config()
+    data = ctx.load_profile()
     providers = read_providers(ctx)
-    inbox = _inbox_of(ctx, config)
-    memory = effective_memory_dir(config, inbox=inbox)
-    skills = effective_skills_dir(config, inbox=inbox)
+    inbox = _inbox_of(ctx, data)
+    memory = effective_memory_dir(data, inbox=inbox)
+    skills = effective_skills_dir(data, inbox=inbox)
     registry: ProviderRegistry | None
     try:
         registry = current_registry(ctx)
     except ConfigError:
         registry = None
-    model = cfg.get_value(config, "model") or providers.main_model
+    model = data.get("model") or providers.main_model
     if not model and providers.providers:
         model = _fallback_main_model(providers)
+    profile_path = ctx.profile_path()
+    valid: bool | str = False
+    if profile_path.is_file():
+        try:
+            AgentProfile.load(profile_path)
+            valid = True
+        except (ProfileError, Exception) as exc:  # noqa: BLE001
+            valid = str(exc)
     return {
         "paths": {
             "home": str(cfg.home_dir()),
             "providers": str(ctx.providers),
             "config": str(ctx.config_file),
+            "profile": str(profile_path),
             "cache": str(cfg.cache_dir()),
             "inbox": str(inbox),
             "memory": str(memory),
@@ -934,6 +1216,7 @@ def overview(ctx: Ctx) -> dict[str, Any]:
         "files": {
             "providers_exists": Path(ctx.providers).is_file(),
             "config_exists": Path(ctx.config_file).is_file(),
+            "profile_exists": profile_path.is_file(),
             "memory_store_exists": (memory / "memory.sqlite").is_file(),
         },
         "model": model,
@@ -942,6 +1225,14 @@ def overview(ctx: Ctx) -> dict[str, Any]:
             "count": len(providers.providers),
             "names": [p.name for p in providers.providers],
             "main_model": providers.main_model,
+        },
+        "profile": {
+            "path": str(profile_path),
+            "valid": valid,
+            "id": data.get("id"),
+            "model": data.get("model"),
+            "thinking": data.get("thinking"),
+            "realms": [str(item.get("id")) for item in (data.get("realms") or []) if isinstance(item, dict)],
         },
         "config": {
             key: cfg.describe_value(key, cfg.get_value(config, key)) for key in cfg.KEYS
@@ -962,6 +1253,7 @@ def print_overview(ctx: Ctx) -> int:
             ("home", paths["home"]),
             ("providers", paths["providers"]),
             ("config", paths["config"]),
+            ("profile", paths["profile"]),
             ("cache", paths["cache"]),
             ("inbox", paths["inbox"]),
             ("memory", paths["memory"]),
@@ -983,11 +1275,25 @@ def print_overview(ctx: Ctx) -> int:
             ],
         )
     ctx.out("")
-    ctx.out("config.json")
+    ctx.out("profile")
+    profile = data["profile"]
+    _kv(
+        ctx,
+        [
+            ("路径", profile["path"]),
+            ("状态", "校验通过" if profile["valid"] is True else str(profile["valid"] or "还没建")),
+            ("id", str(profile["id"] or "-")),
+            ("模型", str(profile["model"] or "（跟随 provider main_model）")),
+            ("思考", str(profile["thinking"] or "-")),
+            ("realm", ", ".join(profile["realms"]) or "-"),
+        ],
+    )
+    ctx.out("")
+    ctx.out("config.json（只剩 UI）")
     for key, value in data["config"].items():
         ctx.out(f"  {key.ljust(24)}{value}")
     ctx.out("")
-    ctx.out("  设置: setup set <键> <值>；交互式: setup（无子命令）或 CLI 里 /setup")
+    ctx.out("  profile: setup profile show|path|init|validate|edit|migrate；UI: setup set ui.color 0")
     return 0
 
 
@@ -1017,6 +1323,22 @@ def run_checks(ctx: Ctx) -> list[Check]:
     except ConfigError as exc:
         config = cfg.default_config()
         checks.append(Check("error", "config.json 非法", str(exc)))
+
+    profile_data = ctx.load_profile()
+    try:
+        if ctx.profile_path().is_file():
+            AgentProfile.load(ctx.profile_path())
+            checks.append(Check("ok", "profile.json", str(ctx.profile_path())))
+        else:
+            checks.append(
+                Check(
+                    "warn",
+                    "profile.json 还没建",
+                    f"{ctx.profile_path()}（首次启动会自动生成）",
+                )
+            )
+    except Exception as exc:  # noqa: BLE001 - profile 会执行代码，错误要完整显示
+        checks.append(Check("error", "profile.json 非法", str(exc)))
 
     try:
         providers = read_providers(ctx)
@@ -1050,8 +1372,11 @@ def run_checks(ctx: Ctx) -> list[Check]:
         except ProviderConfigError as exc:
             checks.append(Check("warn", "默认模型不可用", str(exc)))
 
-    configured_memory = cfg.get_value(config, "memory.dir")
-    memory = memory_dir_for(ctx, config)
+    settings = memory_settings(ctx, profile_data)
+    configured_memory = settings["dir"]
+    memory = memory_dir_for(ctx, profile_data)
+    if not settings["enabled"]:
+        checks.append(Check("warn", "记忆未启用", "setup memory enable 或改 profile"))
     if configured_memory:
         try:
             memory.mkdir(parents=True, exist_ok=True)
@@ -1064,7 +1389,7 @@ def run_checks(ctx: Ctx) -> list[Check]:
             Check("ok", "记忆目录", f"{memory}（默认位置，首次写入时自动创建）")
         )
 
-    skills = skills_dir_for(ctx, config)
+    skills = skills_dir_for(ctx, profile_data)
     checks.append(
         Check(
             "ok" if skills.is_dir() else "warn",
@@ -1121,6 +1446,7 @@ def ensure_layout(ctx: Ctx) -> dict[str, Any]:
         "home": None,
         "config": None,
         "providers": None,
+        "profile": None,
         "cache": None,
     }
     home_existed = cfg.home_dir().is_dir()
@@ -1135,6 +1461,16 @@ def ensure_layout(ctx: Ctx) -> dict[str, Any]:
         created["config"] = ctx.save_config(cfg.default_config())
     if not Path(ctx.providers).is_file():
         created["providers"] = cfg.write_json(ctx.providers, {"providers": []})
+    profile_path = ctx.profile_path()
+    if not profile_path.is_file():
+        migrated = cfg.migrate_to_profile(
+            config_path=ctx.config_file,
+            profile_path=profile_path,
+            provider_file=str(ctx.providers),
+        )
+        created["profile"] = migrated or prof.save_raw(
+            profile_path, prof.default_profile(provider_file=str(ctx.providers))
+        )
     return created
 
 
@@ -1149,7 +1485,8 @@ def setup_init(ctx: Ctx) -> int:
     if not any(created.values()):
         ctx.out("配置骨架已存在，没有改动")
     ctx.out(f"  providers: {ctx.providers}")
-    ctx.out(f"  config   : {ctx.config_file}")
+    ctx.out(f"  config   : {ctx.config_file}（只剩 UI）")
+    ctx.out(f"  profile  : {ctx.profile_path()}")
     return 0
 
 
@@ -1184,18 +1521,19 @@ def _merge_result(target: WizardResult, part: WizardResult) -> WizardResult:
 
 def _print_header(ctx: Ctx) -> None:
     try:
-        config = ctx.load_config()
         providers = read_providers(ctx)
+        data = ctx.load_profile()
     except ConfigError as exc:
         _fail(ctx, str(exc))
         return
-    memory_on = "开" if cfg.get_value(config, "memory.enabled", True) else "关"
+    memory_on = "开" if memory_settings(ctx, data)["enabled"] else "关"
     ctx.out("")
     ctx.out("Liorium 配置")
     ctx.out(f"  provider  {len(providers.providers)} 个  默认 {providers.main_model or '（未设置）'}")
-    ctx.out(f"  记忆      {memory_on}  {memory_dir_for(ctx, config)}")
+    ctx.out(f"  记忆      {memory_on}  {memory_dir_for(ctx, data)}")
     ctx.out(f"  文件      {ctx.providers}")
     ctx.out(f"            {ctx.config_file}")
+    ctx.out(f"            {ctx.profile_path()}")
 
 
 def wizard(ctx: Ctx, topic: str | None = None) -> WizardResult:
@@ -1210,6 +1548,11 @@ def wizard(ctx: Ctx, topic: str | None = None) -> WizardResult:
         return wizard_providers(ctx)
     if key in ("memory", "mem"):
         return wizard_memory(ctx)
+    if key in ("profile", "agent"):
+        # profile 目前没有交互式子向导：展示 + 指路（编辑用命令行 / 编辑器）。
+        print_overview(ctx)
+        ctx.out("  改 profile: setup profile edit / setup profile show / setup profile validate")
+        return result
     while True:
         _print_header(ctx)
         ctx.out("  1) provider  2) 记忆系统  3) 查看全部  4) 体检  5) 建空配置  0) 完成")
@@ -1382,19 +1725,18 @@ def _wizard_remove_provider(ctx: Ctx) -> bool:
     return True
 
 
-def _print_memory(ctx: Ctx, config: Mapping[str, Any]) -> None:
-    enabled = cfg.get_value(config, "memory.enabled", True)
-    directory = memory_dir_for(ctx, config)
+def _print_memory(ctx: Ctx, data: Mapping[str, Any]) -> None:
+    settings = memory_settings(ctx, data)
     ctx.out("")
     ctx.out("记忆系统")
     _kv(
         ctx,
         [
-            ("开关", "开" if enabled else "关"),
-            ("目录", str(directory)),
-            ("embed", str(cfg.get_value(config, "memory.embed_model", "") or "（未设置）")),
-            ("向量索引", "开" if cfg.get_value(config, "memory.vectors", True) else "关"),
-            ("实体抽取", "开" if cfg.get_value(config, "memory.extraction", True) else "关"),
+            ("开关", "开" if settings["enabled"] else "关"),
+            ("目录", str(memory_dir_for(ctx, data))),
+            ("embed", settings["embed_model"] or "（未设置）"),
+            ("向量索引", "开" if settings["vectors"] else "关"),
+            ("实体抽取", "开" if settings["extraction"] else "关"),
         ],
     )
     ctx.out(
@@ -1406,71 +1748,49 @@ def _print_memory(ctx: Ctx, config: Mapping[str, Any]) -> None:
 def wizard_memory(ctx: Ctx) -> WizardResult:
     result = WizardResult()
     while True:
-        config = ctx.load_config()
-        _print_memory(ctx, config)
+        data = ctx.load_profile()
+        _print_memory(ctx, data)
+        settings = memory_settings(ctx, data)
         choice = ctx.ask("操作 [0]: ").strip() or "0"
         if choice in ("0", "q", ""):
             return result
         try:
             if choice == "1":
                 raw = ctx.ask("记忆库目录（留空 = 用默认 <inbox>/memory）: ").strip()
-                if raw:
-                    cfg.set_value(config, "memory.dir", raw)
-                    ctx.save_config(config)
-                    result.memory_dir_changed = True
-                    result.memory_changed = True
-                    _ok(ctx, f"memory.dir = {raw}")
-                else:
-                    cfg.unset_value(config, "memory.dir")
-                    ctx.save_config(config)
-                    result.memory_dir_changed = True
-                    result.memory_changed = True
-                    _ok(ctx, "memory.dir 已恢复默认")
+                memory_set(ctx, "dir", raw)
+                result.memory_dir_changed = True
+                result.memory_changed = True
             elif choice == "2":
                 raw = ctx.ask("embedding 模型（留空 = 关闭语义检索）: ").strip()
-                cfg.set_value(config, "memory.embed_model", raw)
-                ctx.save_config(config)
+                memory_set(ctx, "embed-model", raw)
                 result.memory_embed_changed = True
                 result.memory_changed = True
-                _ok(ctx, f"memory.embed_model = {raw or '(空)'}")
             elif choice == "3":
-                raw = ctx.ask("embedding base_url（留空 = 跟随 provider）: ").strip()
-                cfg.set_value(config, "memory.embed_base_url", raw)
-                ctx.save_config(config)
+                raw = ctx.ask("embedding base_url（留空 = 清空）: ").strip()
+                memory_set(ctx, "embed-base-url", raw)
                 result.memory_embed_changed = True
                 result.memory_changed = True
-                _ok(ctx, f"memory.embed_base_url = {raw or '(空)'}")
             elif choice == "4":
-                raw = _secret_input(ctx, "embedding API key（留空 = 跟随 provider）: ").strip()
-                cfg.set_value(config, "memory.embed_key", raw)
-                ctx.save_config(config)
+                raw = _secret_input(ctx, "embedding API key（留空 = 清空）: ").strip()
+                memory_set(ctx, "embed-key", raw)
                 result.memory_embed_changed = True
                 result.memory_changed = True
-                _ok(ctx, f"memory.embed_key = {cfg.mask_secret(raw)}")
             elif choice == "5":
-                enabled = not bool(cfg.get_value(config, "memory.enabled", True))
-                cfg.set_value(config, "memory.enabled", enabled)
-                ctx.save_config(config)
+                enabled = not settings["enabled"]
+                memory_enable(ctx, enabled)
                 result.memory_enabled = enabled
                 result.memory_changed = True
-                _ok(ctx, "记忆已启用" if enabled else "记忆已停用")
             elif choice == "6":
-                checked = not bool(cfg.get_value(config, "memory.vectors", True))
-                cfg.set_value(config, "memory.vectors", checked)
-                ctx.save_config(config)
+                memory_set(ctx, "vectors", "0" if settings["vectors"] else "1")
                 result.memory_embed_changed = True
                 result.memory_changed = True
-                _ok(ctx, "向量索引已开" if checked else "向量索引已关（只跑关键词）")
             elif choice == "7":
-                checked = not bool(cfg.get_value(config, "memory.extraction", True))
-                cfg.set_value(config, "memory.extraction", checked)
-                ctx.save_config(config)
+                memory_set(ctx, "extraction", "0" if settings["extraction"] else "1")
                 result.memory_embed_changed = True
                 result.memory_changed = True
-                _ok(ctx, "实体抽取已开" if checked else "实体抽取已关")
             elif choice == "8":
                 directory = ctx.ask(
-                    f"初始化哪个目录 [{memory_dir_for(ctx, config)}]: "
+                    f"初始化哪个目录 [{memory_dir_for(ctx, data)}]: "
                 ).strip()
                 memory_init(ctx, directory or None)
             else:
@@ -1501,18 +1821,27 @@ def build_parser() -> argparse.ArgumentParser:
   liorium-cli setup memory show
   liorium-cli setup memory set dir D:/data/liorium-memory
   liorium-cli setup memory set embed-model text-embedding-3-small
+  liorium-cli setup profile show          # Agent 装配（模型 / realm / 工具集）
+  liorium-cli setup profile validate      # 校验：等价运行期 load（会导入 realm）
   liorium-cli setup doctor                 # 体检：文件 / 密钥 / 目录 / 依赖
   liorium-cli setup init                   # 只建空配置骨架
 
 文件:
   ~/.liorium/providers.json   provider 与密钥（0600）
-  ~/.liorium/config.json      非密钥设置（默认模型 / 思考 / 记忆 / 技能 / UI）
+  ~/.liorium/profile.json     Agent 装配（模型 / realm / 工具集 / 提示词）
+  ~/.liorium/config.json      只剩 UI 偏好（颜色 / 隐藏 reasoning）
   LIORIUM_HOME                改配置根目录（多套配置 / 测试）
 """,
     )
     parser.add_argument("--home", type=Path, default=None, help="配置根目录（默认 ~/.liorium）")
     parser.add_argument("--config-file", type=Path, default=None, help="config.json 路径")
     parser.add_argument("--providers", type=Path, default=None, help="providers.json 路径")
+    parser.add_argument(
+        "--profile",
+        type=Path,
+        default=None,
+        help="profile 路径（默认 ./liorium/profile.json 或 ~/.liorium/profile.json）",
+    )
     parser.add_argument("--json", action="store_true", help="输出 JSON（脚本用）")
     sub = parser.add_subparsers(dest="command")
 
@@ -1591,19 +1920,41 @@ def build_parser() -> argparse.ArgumentParser:
     mset.add_argument("value")
     minit = msub.add_parser("init", help="初始化记忆目录与记忆库")
     minit.add_argument("--dir", dest="directory", default=None, help="同时把目录写进配置")
+
+    prof_p = sub.add_parser("profile", help="Agent Profile（装配：模型 / realm / 工具集）")
+    psub = prof_p.add_subparsers(dest="profile_command")
+    psub.add_parser("show", help="查看 profile（默认值补齐、密钥打码）")
+    psub.add_parser("path", help="打印 profile 路径")
+    p_init = psub.add_parser("init", help="生成默认 profile（已存在不覆盖）")
+    p_init.add_argument("--template", default=None, help="复制一份已有 profile 当模板")
+    p_init.add_argument("--force", action="store_true", help="已存在时覆盖")
+    p_validate = psub.add_parser("validate", help="校验 profile（默认等价运行期 load）")
+    p_validate.add_argument(
+        "--schema-only",
+        dest="schema_only",
+        action="store_true",
+        help="只查 JSON 结构：不导入 realm、不执行代码",
+    )
+    p_validate.add_argument(
+        "--provider", action="store_true", help="额外校验 provider_file 能读出来"
+    )
+    psub.add_parser("edit", help="用 $EDITOR 打开 profile")
+    psub.add_parser("migrate", help="把旧 config.json 迁移成 profile（一次性）")
     return parser
 
 
 def _dispatch(ctx: Ctx, args: argparse.Namespace) -> int:
     command = args.command
     if command == "path":
+        profile_data = ctx.load_profile()
         data = {
             "home": str(cfg.home_dir()),
             "providers": str(ctx.providers),
             "config": str(ctx.config_file),
+            "profile": str(ctx.profile_path()),
             "cache": str(cfg.cache_dir()),
-            "memory": str(memory_dir_for(ctx, ctx.load_config())),
-            "skills": str(skills_dir_for(ctx, ctx.load_config())),
+            "memory": str(memory_dir_for(ctx, profile_data)),
+            "skills": str(skills_dir_for(ctx, profile_data)),
         }
         if ctx.json_mode:
             ctx.emit_json(data)
@@ -1685,6 +2036,26 @@ def _dispatch(ctx: Ctx, args: argparse.Namespace) -> int:
             return memory_init(ctx, args.directory)
         raise ConfigError(f"未知 memory 子命令: {action!r}")
 
+    if command == "profile":
+        action = getattr(args, "profile_command", None) or "show"
+        if action == "show":
+            return profile_show(ctx)
+        if action == "path":
+            return profile_path(ctx)
+        if action == "init":
+            return profile_init(ctx, template=args.template, force=bool(args.force))
+        if action == "validate":
+            return profile_validate(
+                ctx,
+                schema_only=bool(args.schema_only),
+                provider=bool(args.provider),
+            )
+        if action == "edit":
+            return profile_edit(ctx)
+        if action == "migrate":
+            return profile_migrate(ctx)
+        raise ConfigError(f"未知 profile 子命令: {action!r}")
+
     raise ConfigError(f"未知子命令: {command!r}")
 
 
@@ -1749,6 +2120,7 @@ def main(
         home=args.home,
         config_file=args.config_file,
         providers=args.providers,
+        profile=args.profile,
         input_fn=input_fn,
         print_fn=print_fn,
         json_mode=bool(args.json),
@@ -1760,7 +2132,7 @@ def main(
                 return 0
             print_fn(
                 "用法: liorium-cli setup <init|path|show|doctor|get|set|unset|"
-                "providers|memory|wizard>"
+                "providers|memory|profile|wizard>"
             )
             print_fn("  交互式: 直接运行 liorium-cli setup（终端里）或在 CLI 里输入 /setup")
             return 0
@@ -1796,6 +2168,12 @@ __all__ = [
     "memory_show",
     "overview",
     "print_overview",
+    "profile_edit",
+    "profile_init",
+    "profile_migrate",
+    "profile_path",
+    "profile_show",
+    "profile_validate",
     "providers_add",
     "providers_default",
     "providers_edit",

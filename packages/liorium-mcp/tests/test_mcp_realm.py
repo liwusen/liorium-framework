@@ -251,7 +251,7 @@ async def test_realm_assembles_through_manager(tmp_path: Path) -> None:
         state_dir=tmp_path / "state",
         factories={"mcp": lambda spec: realm},
     )
-    manager.assemble([RealmSpec(id="mcp", params={"servers": []})])
+    manager.assemble([RealmSpec(id="mcp", config={"servers": []})])
     await manager.start_all()
     try:
         assert manager._records["mcp"].state == "running"  # noqa: SLF001

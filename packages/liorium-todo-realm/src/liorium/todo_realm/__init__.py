@@ -17,7 +17,7 @@ agent = LioriumAgent(
 )
 ```
 
-节奏：``RealmSpec(id="todo", params={"context_every": 10})`` 可覆盖默认的 50。
+节奏：``RealmSpec(id="todo", config={"context_every": 10})`` 可覆盖默认的 50。
 """
 
 from __future__ import annotations

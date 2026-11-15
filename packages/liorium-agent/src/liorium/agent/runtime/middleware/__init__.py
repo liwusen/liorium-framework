@@ -20,9 +20,11 @@ user 消息"，而它自己不需要看见任何重写。
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from langchain.agents.middleware import ModelRetryMiddleware
+
+from liorium.core.types import ContextItem
 
 from ...context import ContextChannel
 from .compact import CompactMiddleware
@@ -50,17 +52,28 @@ def build_chain(
     max_retries: int = 2,
     realm_middlewares: Sequence[Any] = (),
     context_channel: ContextChannel | None = None,
+    on_context_materialized: Callable[[Sequence[ContextItem]], None] | None = None,
+    env_context: Callable[[], Sequence[ContextItem]] | None = None,
 ) -> list[Any]:
     """装配完整中间件链：realm 外层 + 基座固定顺序。
 
     - ``compact`` 为 None 时（例如假模型测试）跳过压缩，但顺序其它项不变；
     - ``context_channel`` 为 None 时**不装** ``context_merge``（没有通道就没有
-      待物化项，装了也是空转；宿主不用 ``inject()`` 时保持链条最短）。
+      待物化项，装了也是空转；宿主不用 ``inject()`` 时保持链条最短）；
+    - ``on_context_materialized`` 只做观测（补 ``input.delivered`` 帧），不参与物化；
+    - ``env_context``：回合进行中按 ``env_interval`` 节流取用 ``ENVIRONMENT`` 的
+      同步回调，只在该中间件里生效（``context_channel`` 为空时一并失效）。
     """
     chain: list[Any] = []
     chain.extend(realm_middlewares)
     if context_channel is not None:
-        chain.append(ContextMergeMiddleware(context_channel))
+        chain.append(
+            ContextMergeMiddleware(
+                context_channel,
+                on_materialized=on_context_materialized,
+                env_context=env_context,
+            )
+        )
     chain.append(MultimodalBridgeMiddleware(artifacts=artifacts))
     chain.append(ToolCallRepairMiddleware())
     if server_tool_specs:

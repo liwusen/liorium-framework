@@ -100,18 +100,6 @@ class TurnError(LioriumError):
         super().__init__(message)
 
 
-class TurnDropped(LioriumError):
-    """回合在排队阶段被丢弃（调度器拥塞 + ``FLAG.DROPPABLE``）。
-
-    与 ``TurnInterrupted`` 区分开：被丢弃的回合**从来没开始执行**，没有产生任何
-    事件，也不该被当成"被中断"（前者可能已经落过部分 delta）。
-    """
-
-    def __init__(self, reason: str = "congested") -> None:
-        self.reason = reason
-        super().__init__(f"回合被丢弃: {reason}")
-
-
 class CheckpointError(LioriumError):
     """checkpoint 打开/读取/写入失败。"""
 
@@ -129,7 +117,6 @@ __all__ = [
     "RealmStartError",
     "SpecError",
     "ToolNameConflictError",
-    "TurnDropped",
     "TurnError",
     "TurnInterrupted",
     "LioriumError",

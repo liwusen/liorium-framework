@@ -13,7 +13,7 @@ from liorium.core_tool_realm import CoreToolRealm
 from liorium.memory import MemoryRealm, SqliteMemoryStore
 from liorium.skills import SkillsRealm
 from liorium.todo_realm import TodoRealm
-from liorium_testkit import make_scripted_factory
+from liorium_testkit import collect_turn, make_scripted_factory
 
 
 def tool_call(call_id: str, name: str, args: dict) -> AIMessage:
@@ -32,7 +32,7 @@ def write_skill(root: Path, slug: str, description: str) -> None:
 
 
 async def collect(agent: LioriumAgent, text: str) -> list:
-    return [event async for event in agent.run(text)]
+    return await collect_turn(agent, text)
 
 
 @pytest.mark.asyncio
@@ -52,7 +52,12 @@ async def test_agent_with_memory_and_skills(agent_workspace: Path) -> None:
         inbox_dir=agent_workspace,
         model="fake::chat",
         prompt_sources=("AGENT.md",),
-        realms=(RealmSpec(id="core"), RealmSpec(id="memory"), RealmSpec(id="skills")),
+        realms=(
+            RealmSpec(id="core"),
+            # 本用例只关心读写/检索；抽取会额外调用模型，抢走脚本化响应。
+            RealmSpec(id="memory", config={"extraction": False}),
+            RealmSpec(id="skills"),
+        ),
         limits=Limits(context_window=16000, max_turns=8),
         workspace_root=agent_workspace,
     )

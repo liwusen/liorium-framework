@@ -9,7 +9,7 @@
 ```powershell
 git clone https://github.com/liwusen/liorium-framework.git
 cd liorium-framework
-# 建 .venv 并安装 12 个模块（可编辑模式）+ 全部 extra
+# 建 .venv 并安装 13 个模块（可编辑模式）+ 全部 extra
 uv sync --all-packages --all-extras
 
 # 本机 PyPI 慢时用离线模式（依赖已缓存过才行）
@@ -19,7 +19,7 @@ uv sync --all-packages --all-extras --offline
 .\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider
 ```
 
-Python 3.11+。开发期 12 个模块各自是可编辑安装的**命名空间包**：每个模块只有
+Python 3.11+。开发期 13 个模块各自是可编辑安装的**命名空间包**：每个模块只有
 `packages/<包>/src/liorium/<sub>/__init__.py`，那些 `src/liorium/` 下没有 `__init__.py`
 （`tests/test_architecture.py` 会检查）；发布版则合并成**一个** `liorium` 发行版
 （`pip install "liorium[all]"`），导入前缀与下表完全一致。
@@ -43,7 +43,8 @@ liorium-cli --help
 | `liorium-skills` | `liorium.skills` | `skills://` 只读挂载 + `list_skills`（extra `[skills]`） |
 | `liorium-mcp` | `liorium.mcp` | 运行时发现 MCP 工具（extra `[mcp]`） |
 | `liorium-todo-realm` | `liorium.todo_realm` | 状态化待办 `todo` / `todo_list` + 每 50 回合提醒（extra `[todo]`） |
-| `liorium-provider-manager` | `liorium.provider` | Provider schema / 四种 API 格式 / 思考 / 模型构建 |
+| `liorium-provider-manager` | `liorium.provider` | Provider schema / 四种 API 格式 / 思考 / 模型构建 / `ChatModelPool` |
+| `liorium-profile` | `liorium.profile` | Agent Profile：`profile.json` → `AgentSpec` + realm 工厂表 + 模型池 |
 | `liorium-cli` | `liorium.cli` | 官方命令行 Agent（`liorium-cli` / `python -m liorium.cli`） |
 
 想先要一个能对话的成品，直接跑 CLI（真实模型、core 工具、记忆、技能、待办、子代理 ——
@@ -63,16 +64,18 @@ liorium-cli --help
 #   liorium-cli -p "统计仓库里有多少个 .py 文件"
 ```
 
-配置落在 `~/.liorium/`：`providers.json`（provider + 密钥，0600）与 `config.json`
-（非密钥设置：默认模型 / 思考 / 记忆 / 技能 / UI）。两个文件都可以不存在——新机器第一次
-运行会建空骨架并进入「未配置」模式，`/setup` 或 `liorium-cli setup` 随时补配置；
-`liorium-cli setup show|doctor|memory …` 见
+配置落在 `~/.liorium/`：`providers.json`（provider + 密钥，0600）、`profile.json`
+（Agent 装配：模型 / realm / 工具集 / 提示词）与 `config.json`（只剩 UI 偏好：颜色 /
+是否隐藏 reasoning）。三个文件都可以不存在——新机器第一次运行会生成默认 profile 与空骨架，
+进入「未配置」模式，`/setup` 或 `liorium-cli setup` 随时补配置；
+`liorium-cli setup show|doctor|profile …` 见
 [liorium-cli README](../packages/liorium-cli/README.md)。
 
 ## 2. 最小 Agent（离线可跑）
 
 一个 Agent = `AgentSpec`（可序列化的装配）+ `model_factory`（把 `provider::model`
-标签变成 LangChain ChatModel 实例）。`start()` **不调模型**，第一次模型调用发生在 `run()`。
+标签变成 LangChain ChatModel 实例）。`start()` **不调模型**，第一次模型调用发生在
+`push()` 之后的第一个回合。
 
 ```python
 # minimal_agent.py
@@ -126,6 +129,23 @@ class EchoModel(BaseChatModel):
             yield ChatGenerationChunk(message=AIMessageChunk(content=text[i : i + 4]))
 
 
+async def ask(agent: LioriumAgent, text: str, *, id: str) -> str:
+    """投递一条并消费到终态帧；返回拼好的正文。"""
+    subscription = agent.stream(ids=[id])       # ① 先订阅（__aiter__ 那一刻才注册）
+    iterator = subscription.__aiter__()
+    try:
+        agent.push(text, id=id)                 # ② 再投递 → 帧不会漏
+        parts: list[str] = []
+        async for event in iterator:
+            if event.type == "delta":
+                parts.append(str(event.get("content") or ""))
+            elif event.type in ("done", "interrupted", "error"):
+                break                           # ③ 终态帧：每回合恰好一条、且是最后一条
+        return "".join(parts)
+    finally:
+        await subscription.aclose()
+
+
 async def main() -> None:
     inbox = Path(".liorium-demo")
     inbox.mkdir(exist_ok=True)
@@ -141,10 +161,9 @@ async def main() -> None:
         ),
         model_factory=lambda label: EchoModel(),
     )
-    await agent.start()          # 起 realm / 开 checkpoint / 建图；不调模型
+    await agent.start()          # 起 realm / 开 checkpoint / 建图 / 拉起 worker；不调模型
     try:
-        async for event in agent.run("你好，Liorium"):
-            print(event.to_dict())   # 扁平形态：{"type": ..., **payload}
+        print(await ask(agent, "你好，Liorium", id="hello"))
     finally:
         await agent.close()          # 幂等
 
@@ -153,14 +172,22 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-输出（每个 delta 是一条流式分片）：
+输出：
 
 ```text
-{'type': 'start', 'turn_id': 'demo#1'}
-{'type': 'delta', 'content': '收到：你'}
-{'type': 'delta', 'content': '好，Ve'}
-{'type': 'delta', 'content': 'sper'}
-{'type': 'done', 'turn_id': 'demo#1'}
+收到：你好，Liorium
+```
+
+`ask()` 丢弃了帧的细节。真正流过的帧（`ids=["hello"]` 只放行本回合与这个 id）：
+
+```text
+{'type': 'input', 'id': 'hello', 'state': 'accepted'}
+{'type': 'start', 'turn_id': 'demo#1', 'origin': 'user', 'inputs': ['hello']}
+{'type': 'input', 'id': 'hello', 'state': 'delivered', 'turn_id': 'demo#1'}
+{'type': 'delta', 'content': '收到：你'}      # 每个 delta 是一条流式分片
+{'type': 'delta', 'content': '好，Li'}
+{'type': 'delta', 'content': 'orium'}
+{'type': 'done', 'turn_id': 'demo#1'}        # 终态帧：恰好一条，且最后一条
 ```
 
 > 假模型不上报 token 用量，所以 `context_window > 0` 时日志里会多一条
@@ -178,7 +205,7 @@ if __name__ == "__main__":
 | `realms` | `tuple[RealmSpec, ...] = ()` | realm 声明（见 [EXTENDING](EXTENDING.md)） |
 | `toolsets` | `Mapping[str, tuple[str, ...]] = {}` | 由 `core` realm 读取：`"default"` 键筛六个核心工具名；未知名字抛 `ValueError`（Agent 自己不解释它） |
 | `limits` | `Limits()` | 阈值，见第 9 节 |
-| `boot` | `BootSpec \| None = None` | 首次引导语；**库不自动执行**，宿主自己决定要不要 `run(boot.message)` |
+| `boot` | `BootSpec \| None = None` | 首次引导语；**库不自动执行**，宿主自己决定要不要 `push(boot.message, id="boot")` |
 | `workspace_root` | `Path \| None = None` | 裸路径的基准；`None` 时等于 `inbox_dir` |
 
 ## 3. 接真实模型
@@ -216,13 +243,13 @@ $env:LIORIUM_API_KEY  = "<key>"
 
 ## 4. 消息与事件
 
-`run()` 返回的生成器是**唯一**事件出口，只产出 **9 种 Agent 事件**（2026-11-08 起没有
-「宿主事件」：等待期间零事件，中断/丢弃/失败用异常表达）。
-`tests/test_event_contract.py` 是这份契约的金样。
+`stream()` 是**唯一**事件出口（可开多个、彼此独立），共 **14 种事件**。没有「宿主事件」：
+等待期间零事件，回合的结束由**终态帧**表达（每个回合恰好一条 `done` / `interrupted` /
+`error`，且是该回合最后一条）。`tests/test_event_contract.py` 是这份契约的金样。
 
 | type | payload | 含义 |
 |---|---|---|
-| `start` | `turn_id` | 回合开始；`turn_id` 形如 `<agent_id>#<序号>` |
+| `start` | `turn_id` / `origin` / `inputs` | 回合开始；`turn_id` 形如 `<agent_id>#<序号>`，`inputs` 是触发本回合的入站 id 列表 |
 | `delta` | `content` | 正文增量（空串不发） |
 | `reasoning_delta` | `content` | 思考增量（OpenAI Chat 的 `reasoning_content` / Responses、Anthropic、Gemini 的 thinking 块） |
 | `tool_start` | `tool_name` / `args` / `call_id` | 工具开始；`call_id` 取 LangGraph 的 `run_id` |
@@ -230,15 +257,16 @@ $env:LIORIUM_API_KEY  = "<key>"
 | `compact_start` | 无 | 压缩开始（压缩调用的事件被分流，绝不进正文 `delta`） |
 | `compact_delta` | `content` | 摘要文本（一次压缩只发一条，不是流式分片） |
 | `compact_done` | `ok`（失败时另有 `error`） | 压缩结束；`ok=False` 表示失败（不改 checkpoint，回合继续） |
-| `done` | `turn_id` | 回合正常结束；与 `start` 的 `turn_id` 相同 |
+| `round_aborted` | `turn_id` / `reason` | **非终态**：模型轮被 `IMMEDIATE` 插话切掉（v1 只有 `"preempted"`），同一 `turn_id` 会继续跑 |
+| `interrupted` | `turn_id` / `reason` | **终态**：`reason` ∈ `preempted` / `user` / `close` |
+| `error` | `turn_id` / `error` | **终态**：`error` 是 `"类名: 消息"`，traceback 只进日志 |
+| `input` | `id` / `state` / 可选 `turn_id` | 入站生命周期：`accepted` / `delivered` / `expired` / `dropped` |
+| `realm` | `realm` / `name` / `data` / 回合内另有 `turn_id` | **非终态**：realm 主动推的帧（`ctx.emit`），不开回合、不落 checkpoint，2026-11-14 追加 |
+| `done` | `turn_id` | **终态**：回合正常结束，与 `start` 的 `turn_id` 相同；不带 `final_text` |
 
-终止不是事件：
-
-| 异常 | 语义 | 字段 |
-|---|---|---|
-| `TurnInterrupted` | 被 `interrupt()` 叫停或被更高优先级回合抢占；**不会**有 `done` | `reason`（抢占时 `"preempted"`） |
-| `TurnDropped` | 排队拥塞被丢弃（`FLAG.DROPPABLE`）；从未开始执行 | `reason` |
-| `TurnError` | 回合执行失败（模型 / 工具 / 图） | `message`、`cause` |
+回合失败不再是"消费者捕获异常"：`execute_turn` 抛出的错误由 worker 翻译成 `error` 终态帧
+（`TurnInterrupted` → `interrupted`）。`push()` 早于 `start()` 或晚于 `close()` 仍抛
+`TurnError`（那是调用顺序错误，不是回合事件）。
 
 ```python
 from liorium.core.types import Event
@@ -253,7 +281,10 @@ except ValueError as exc:
 约束（违反即前端错乱）：
 
 - `Event` 构造时校验类型，未知类型直接 `ValueError`；
-- 库只在 `run()` 上提供一条事件流，没有第二条订阅通道；
+- `stream()` 可以开多条，每条都是**完整视图**、**不回放**（订阅之后才有帧）；
+- 终态帧每回合恰好一条且在最后：看到 `done` / `interrupted` / `error` 就结束这一回合的消费；
+- `realm` 是 realm 主动推的**非终态**帧（`ctx.emit`）：可能出现在回合内任何位置（与工具帧
+  不保证先后），空闲时也可能出现且不带 `turn_id`；别把它当回合边界；
 - `agent_id` 由调用方自己拼（库不打标）。
 
 ## 5. 一个回合发生了什么
@@ -262,29 +293,37 @@ except ValueError as exc:
 sequenceDiagram
     participant H as 调用方
     participant A as LioriumAgent
-    participant S as TurnScheduler
+    participant I as Inbox
+    participant W as TurnWorker
     participant L as execute_turn
     participant G as LangGraph(create_agent)
+    participant E as EventHub
 
-    H->>A: run(text, context=[...], priority=?, flags=?)
-    A->>S: acquire(priority, flags) 排队，不抛忙
-    Note over S,A: 带 INTERRUPTING 且优先级严格更高时可抢占（旧回合抛 TurnInterrupted）
+    H->>A: push(text, id=..., bucket=..., flags=...)
+    A->>I: 入队（同 id 原位替换 / timeout / 合批）
+    H->>E: stream()（先订阅，不回放）
+    W->>I: peek_turn_entry()（IMMEDIATE 先于 MAJOR）
     A->>A: 回合边界 reconcile（realm dirty）
     A->>L: 合并「回合开头到达的 Context」进 user 消息
-    L-->>H: start
+    L-->>E: start(turn_id, origin, inputs)
     L->>G: astream_events({"messages": [...], "context": [...]})
     G-->>L: on_chat_model_stream / on_tool_start / on_tool_end
-    L-->>H: delta / reasoning_delta / tool_start / tool_result
-    L-->>H: done
-    Note over A,H: 迭代结束 = 回合结束；错误抛 TurnError / TurnInterrupted / TurnDropped
+    L-->>E: delta / reasoning_delta / tool_start / tool_result
+    L-->>E: done（终态帧，恰好一条且最后）
 ```
 
 要点：
 
-- **执行位在 Agent 内部**：同一 Agent 的并发 `run()` 由 `TurnScheduler` 排队
-  （优先级 + FIFO + 三个标志），同进程多个 Agent 的并发由调用方自己控制（第 10 节）。
-- **`interrupt()` 取消本回合**的托管任务与模型流；历史里被打断的半条消息保留，悬空
+- **执行位在 Agent 内部**：`TurnWorker` 单执行位串行处理同一 Agent 的 Inbox（`IMMEDIATE`
+  先于 `MAJOR`，同档 FIFO）；同进程多个 Agent 的并发由调用方自己控制（第 10 节）。
+- **插话不结束回合**：`push(bucket=Bucket.IMMEDIATE)` 会在安全点切掉当前模型轮（补一条非终态
+  `round_aborted`），同一 `turn_id` 换新消息继续；工具执行中不打断。
+- **`interrupt()` 取消本回合**的托管任务与模型流，队列保留；历史里被打断的半条消息保留，悬空
   `tool_call` 由 `tool_repair` 中间件补占位，不会让下一回合的模型请求非法。
+- **realm 的只读钩子不改变回合**（第六拍）：六个 `on_*` 进入按声明序、退出反序，抛异常只记日志；
+  要叫停回合用 `ctx.interrupt()`，想影响未来用 `ctx.inject()` / `ctx.push()`。
+- **外部程序可以直接给 realm 发消息**（第七拍）：`await agent.send_to_realm("todo", "todo.add", {"text": …})`
+  —— 立即执行、等结果、不过模型；状态不对（未装配 / 停用 / 失败）直接抛错，见 [EXTENDING §1.6](EXTENDING.md)。
 - 压缩只在 `limits.context_window > 0` 时装配（否则没有阈值可用）。
 
 ## 6. 工具调用
@@ -372,8 +411,14 @@ async def main() -> None:
     )
     await agent.start()
     try:
-        async for event in agent.run("看看 notes.txt"):
+        stream = agent.stream(ids=["see-notes"])    # 订阅先于 push
+        iterator = stream.__aiter__()
+        agent.push("看看 notes.txt", id="see-notes")
+        async for event in iterator:
             print(event.to_dict())
+            if event.type in ("done", "interrupted", "error"):
+                break
+        await stream.aclose()
     finally:
         await agent.close()
 
@@ -381,10 +426,12 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-输出：
+输出（`ids=["see-notes"]` 只放行本回合与这个 id 的帧）：
 
 ```text
-{'type': 'start', 'turn_id': 'demo-tool#1'}
+{'type': 'input', 'id': 'see-notes', 'state': 'accepted'}
+{'type': 'start', 'turn_id': 'demo-tool#1', 'origin': 'user', 'inputs': ['see-notes']}
+{'type': 'input', 'id': 'see-notes', 'state': 'delivered', 'turn_id': 'demo-tool#1'}
 {'type': 'tool_start', 'tool_name': 'read', 'args': {'uri': 'notes.txt'}, 'call_id': '…'}
 {'type': 'tool_result', 'tool_name': 'read', 'output': '第一行\n第二行\n', 'call_id': '…'}
 {'type': 'delta', 'content': '读到了两行。'}
@@ -396,8 +443,8 @@ asyncio.run(main())
 
 ## 7. 中断与恢复
 
-叫停 = `interrupt()` + **一个新的 `run()`**（两个回合）。`interrupt()` 返回是否真的取消了
-一个进行中的回合；空闲时返回 `False`。
+叫停 = `interrupt()` + **再 `push()` 一条**（两个回合）。`interrupt()` 返回是否真的取消了一个
+进行中的回合；空闲时返回 `False`。当前回合以 `interrupted` 终态帧收尾（**不是**异常）。
 
 ```python
 # 接第 2 节的 EchoModel
@@ -405,7 +452,6 @@ import asyncio
 from pathlib import Path
 
 from liorium.agent import AgentSpec, Limits, LioriumAgent
-from liorium.core.errors import TurnInterrupted
 
 
 async def main() -> None:
@@ -424,17 +470,23 @@ async def main() -> None:
     )
     await agent.start()
     try:
-        try:
-            async for event in agent.run("说点什么"):
-                print(event.to_dict())
-                if event.type == "start":
-                    print("interrupt ->", await agent.interrupt(reason="user_stop"))
-        except TurnInterrupted as exc:
-            print("回合被中断:", exc.reason)
+        stream = agent.stream(ids=["turn-1", "turn-2"])
+        iterator = stream.__aiter__()
 
-        async for event in agent.run("继续"):
+        agent.push("说点什么", id="turn-1")
+        async for event in iterator:
+            print(event.to_dict())
+            if event.type == "start":
+                print("interrupt ->", await agent.interrupt(reason="user_stop"))
+            if event.type in ("done", "interrupted", "error"):
+                break                      # 第一回合以 interrupted 收尾
+
+        agent.push("继续", id="turn-2")     # 队列保留，新条目开新回合
+        async for event in iterator:
             if event.type == "done":
                 print("第二个回合结束:", event.get("turn_id"))
+                break
+        await stream.aclose()
     finally:
         await agent.close()
 
@@ -444,10 +496,10 @@ asyncio.run(main())
 
 语义：
 
-- 中断后**不会**收到 `done`，也不会有 `interrupted` / `error` 事件（终止用异常表达）；
+- 中断后收到的是 `interrupted` **终态帧**（`reason="user_stop"`），不是异常；
 - 被打断的半条 AI 消息留在历史里，悬空 `tool_call` 由 `tool_repair` 补占位；
-- 下一次 `run()` 是**新回合**，`turn_id` 序号 +1；
-- `close()` 内部也会 `interrupt(reason="agent_close")`。
+- 下一次 `push()` 是**新回合**，`turn_id` 序号 +1（队列里的其它条目照常保留）；
+- `close()` 会让在跑的回合以 `interrupted(reason="close")` 收尾，并丢弃 pending（不发帧）。
 
 ## 8. 运行中注入 ContextItem
 
@@ -494,14 +546,21 @@ async def main() -> None:
     )
     await agent.start()
     try:
-        # 形态①：run() 之前入队 → 并入本回合 user 消息
-        await agent.inject([ContextItem(source="trigger:weather", text="外面开始下雨了")])
-        async for event in agent.run("看看 notes.txt"):
+        stream = agent.stream(ids=["inject-demo"])
+        iterator = stream.__aiter__()
+
+        # 形态①：push 之前入队 → 并入本回合 user 消息
+        agent.inject(ContextItem(source="trigger:weather", text="外面开始下雨了"))
+        agent.push("看看 notes.txt", id="inject-demo")
+        async for event in iterator:
             print(event.type, end=" ")
             if event.type == "tool_start":
                 # 形态②：回合进行中入队 → 下一次模型调用前独立成一条 user 消息
-                await agent.inject([ContextItem(source="subagent:r1", text="子代理已完成")])
+                agent.inject(ContextItem(source="subagent:r1", text="子代理已完成"))
+            if event.type in ("done", "interrupted", "error"):
+                break
         print()
+        await stream.aclose()
 
         snapshot = await agent.graph.aget_state(
             {"configurable": {"thread_id": agent.thread_id}}
@@ -527,7 +586,7 @@ asyncio.run(main())
 - `ContextItem(source, text, meta={}, interrupt=False)`：`source` 形如
   `memory:recall` / `subagent:research-1` / `trigger:desktop`；`interrupt` 字段当前**只被记录、不生效**；
 - 原文另存 `state.context` 审计通道（纯 JSON），不进模型请求；
-- 如果本回合之后没有下一次模型调用，条目会留在队列里，等下一次 `run()` 的回合开头并入
+- 如果本回合之后没有下一次模型调用，条目会留在队列里，等下一次回合开头并入
   （形态①）——这是 `tests/test_turn_loop.py::test_pending_context_becomes_separate_user_message_before_next_model_call`
   覆盖的边界。
 
@@ -568,9 +627,9 @@ print(limits)
 
 ## 10. 多 Agent 并发（调用方策略）
 
-**库本身没有「并发上限」这个概念**：`LioriumAgent` 的 `TurnScheduler` 只保证同一个 Agent
-内部排队。同一时刻允许几个 Agent 在跑，是**调用方**用 `asyncio.Semaphore` 包住
-`async for` 的策略（2026-11-08 起没有宿主许可位）。
+**库本身没有「并发上限」这个概念**：`TurnWorker` 只保证同一个 Agent 内部串行。同一时刻允许
+几个 Agent 在跑，是**调用方**用 `asyncio.Semaphore` 包住自己的投递/消费循环的策略
+（2026-11-08 起没有宿主许可位）。
 
 ```python
 # 接第 2 节的 EchoModel
@@ -605,10 +664,16 @@ async def main() -> None:
 
     async def drain(agent: LioriumAgent) -> None:
         chunks: list[str] = []
+        stream = agent.stream()
+        iterator = stream.__aiter__()          # 先订阅
         async with semaphore:                  # 整个回合（含工具）占一个名额
-            async for event in agent.run("用一句话介绍 Liorium"):
+            agent.push("用一句话介绍 Liorium", id=f"{agent.spec.id}-intro")
+            async for event in iterator:
                 if event.type == "delta":
                     chunks.append(str(event.get("content") or ""))
+                elif event.type in ("done", "interrupted", "error"):
+                    break
+        await stream.aclose()
         outputs[agent.spec.id] = "".join(chunks)
 
     try:
@@ -624,11 +689,14 @@ asyncio.run(main())
 更完整的版本见 [`examples/multi_agent.py`](../examples/multi_agent.py)（两个角色、各自
 inbox / checkpoint / prompt，共享一份 provider 配置）。还要注意：
 
-- **同一个 Agent 内部**用 `run(priority=..., flags=...)` 表达轻重缓急：
-  `INTERRUPTING` 抢占正在跑的低优先级回合、`EXCLUSIVE` 拒绝被抢、`DROPPABLE` 拥塞时丢弃
-  （见 [`design/scheduler.md`](design/scheduler.md)）；
-- 子代理（`RealmSpec(id="subagents")`）的默认优先级比父低一档（`priority - 1`），
-  但每个子 Agent 有自己的执行位：父的抢占不会跨 Agent 传播，叫停用 `stopSubagent`。
+- **同一个 Agent 内部**用 bucket 表达轻重缓急：`Bucket.IMMEDIATE` 插队并可在安全点接管当前
+  模型轮，`Bucket.MAJOR` 等这句说完，`Bucket.BATCHED` 攒够合批窗口后自己开一个回合，
+  `Bucket.ENVIRONMENT` 永不开回合、只顺路搭车；它还会在**回合进行中**每隔
+  `env_interval`（默认 30 s，`LioriumAgent(env_interval=...)`）投递一次，变成一条独立的
+  `<context>` 消息（见 [`design/event-stream.md`](design/event-stream.md)）；
+- 想看全部入站语义一次跑通（bucket / 中途插话 / 环境节流 / 合批 / 中断），见
+  [`examples/event_stream.py`](../examples/event_stream.py)（离线假模型，直接 `python` 运行）；
+- 每个子 Agent 有自己的 worker 与执行位：父的抢占不会跨 Agent 传播，叫停用 `stopSubagent`。
 
 ## 11. 热重载、状态与清空
 
@@ -676,8 +744,9 @@ asyncio.run(main())
   不改变工具与 prompt，所以 epoch 不变（上面输出 `epoch: 1`）。
 - `refresh_realms(force=True)`：宿主**知道**真相源变了（刚装了技能、别的进程写了记忆库）时
   主动触发，不必等下一个回合边界；`force=False` 只刷新自报 `dirty()` 的 realm。
-- `status()` 是快照：`agent_id` / `running` / `turn_id` / `queue_depth` / `spec_fingerprint` /
-  `epoch` / `realms` / `messages` / `pending_context` / `started` / `closed`。
+- `status()` 是快照：`agent_id` / `running` / `turn_id` / `queue_depth`（Inbox 深度）/
+  `spec_fingerprint` / `epoch` / `realms` / `messages` / `pending_context` /
+  `pending_by_bucket`（桶名 → 待处理条数，四个桶恒出现）/ `started` / `closed`。
 
 ## 12. 挂上能力包
 
@@ -740,10 +809,10 @@ asyncio.run(main())
 
 | 包 | 挂载 / 工具 | 真相源 | 默认参数 |
 |---|---|---|---|
-| `liorium-memory` | `/memories`（`memories://`，可写）+ `memory_search` / `memory_list` / `memory_delete` / `memory_tag` / `memory_score` / `memory_graph` / `memory_attach` | `<inbox>/memory/memory.sqlite`（与旧库同 schema）+ `content/<path>` | `params["db_path"]`、`params["content_dir"]`、`params["list_limit"]`（默认 200） |
-| `liorium-skills` | `/skills`（`skills://`，只读）+ `list_skills` | `<inbox>/skill.d/<slug>/SKILL.md` | `params["skills_dir"]`、`params["max_prompt_skills"]`（默认 20） |
-| `liorium-mcp` | 无挂载，工具名 `<server>_<tool>` | 运行中的 MCP server | `params["servers"]`、`params["strict"]`（默认 `False`）、`params["prefix_tools"]`（默认 `True`） |
-| `subagents` | `/subagents`（`subagents://`，可写）+ 7 个子代理工具 | 子 Agent 的 inbox + `realm_state/subagents.json`（名册） | `params["default_toolsets"]`、`params["max_depth"]`、`params["max_children"]`（默认 0 = 不限） |
+| `liorium-memory` | `/memories`（`memories://`，可写）+ `memory_search` / `memory_list` / `memory_delete` / `memory_tag` / `memory_score` / `memory_graph` / `memory_attach` | `<inbox>/memory/memory.sqlite`（与旧库同 schema）+ `content/<path>` | `config["dir"]`、`config["db_path"]`、`config["content_dir"]`、`config["list_limit"]`（默认 200）；`config["embed"]` 打开语义检索 |
+| `liorium-skills` | `/skills`（`skills://`，只读）+ `list_skills` | `<inbox>/skill.d/<slug>/SKILL.md` | `config["skills_dir"]`、`config["max_prompt_skills"]`（默认 20） |
+| `liorium-mcp` | 无挂载，工具名 `<server>_<tool>` | 运行中的 MCP server | `config["servers"]`、`config["strict"]`（默认 `False`）、`config["prefix_tools"]`（默认 `True`） |
+| `subagents` | `/subagents`（`subagents://`，可写）+ 7 个子代理工具 | 子 Agent 的 inbox + `realm_state/subagents.json`（名册） | `config["default_toolsets"]`、`config["max_depth"]`、`config["max_children"]`（默认 0 = 不限） |
 
 子代理有状态：名册与 `TASK.md` / `output.md` / `finalResult.md` 落盘，重启后 `/subagent`、
 `subagents://` 仍在；上次跑到一半的标 `interrupted`，再次 `invokeSubagent` 接着它自己的
@@ -752,12 +821,11 @@ asyncio.run(main())
 `realm_factories` 必须覆盖 spec 里出现的每个 realm id，否则 `start()` 抛
 `RealmNotFoundError`（`subagents` 例外：Agent 会自动注册工厂）。
 
-MCP 的接线方式同样是 `RealmSpec(id="mcp", params={"servers": {...}})` +
-`realm_factories={"mcp": McpRealm}`，但当前有一个缺口：`McpRealm` 还没实现
-`Realm.mounts()`，经 `AgentSpec` 装配时会被 `RealmManager` 标 `failed`（降级、不影响其它
-realm，`status().realms` 里能看到 `error`）。缺口见 `docs/API.md`。
-接通之后，宿主改配置的接法是：`realm.set_servers(...)` 标脏 → `refresh_realms()`（立刻）
-或下一次 `run()` 的回合边界自动重连。
+MCP 的接线方式同样是 `RealmSpec(id="mcp", config={"servers": {...}})` +
+`realm_factories={"mcp": McpRealm}`。`McpRealm` 实现了 `Realm.mounts()`（返回空 dict），
+经 `AgentSpec` 装配能正常启动；单个 server 连不上只记 `error`，其它 server 的工具照常可用。
+宿主改配置的接法是：`realm.set_servers(...)` 标脏 → `refresh_realms()`（立刻）
+或下一次回合边界自动重连。
 `force=True`（默认）先给所有支持 `mark_dirty()` 的 realm 置脏；`force=False` 只刷新
 自报 `dirty()` 的。工具 schema / system prompt 变了，`CacheEpoch` 才 +1。
 
@@ -765,7 +833,7 @@ realm，`status().realms` 里能看到 `error`）。缺口见 `docs/API.md`。
 
 | 现象 | 多半是 | 怎么办 |
 |---|---|---|
-| `TurnError: agent 未 start()，不能 run()` | 忘了 `await start()`，或 `close()` 之后又 `run()` | 生命周期只有 `start` → `run*` → `close`；close 不可逆 |
+| `TurnError: agent 未 start()，不能 push()` | 忘了 `await start()`，或 `close()` 之后又 `push()` | 生命周期只有 `start` → `push` / `stream` → `close`；close 不可逆 |
 | `SpecError: prompt 文件不存在` | `prompt_sources` 相对 `inbox_dir` 找不到文件 | 检查 `inbox_dir` 与文件名；库不会静默跳过缺失的 prompt |
 | `NotImplementedError`（假模型） | 自定义 ChatModel 没实现 `bind_tools` | `bind_tools(tools, **kwargs) -> self` |
 | `ToolNameConflictError` | 两个 realm 声明了同名工具 | 改名；冲突是硬错误，不会静默跳过 |

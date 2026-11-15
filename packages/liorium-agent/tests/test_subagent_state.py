@@ -14,7 +14,7 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from liorium.agent import AgentSpec, Limits, RealmSpec, LioriumAgent
-from liorium_testkit import make_scripted_factory
+from liorium_testkit import collect_turn, make_scripted_factory
 
 
 def make_parent(
@@ -28,7 +28,7 @@ def make_parent(
         inbox_dir=workspace,
         model="fake::chat",
         prompt_sources=("AGENT.md",),
-        realms=(RealmSpec(id="subagents", params=dict(params or {})),),
+        realms=(RealmSpec(id="subagents", config=dict(params or {})),),
         limits=Limits(context_window=8000, max_turns=6),
         workspace_root=workspace,
     )
@@ -270,7 +270,7 @@ async def test_corrupt_registry_fails_loudly(agent_workspace: Path) -> None:
         # 不静默吞：该 realm 降级 failed，原因带路径（§C5 降级但可用）
         assert status.state == "failed"
         assert "subagents.json" in (status.error or "")
-        events = [event async for event in agent.run("还在吗")]
+        events = await collect_turn(agent, "还在吗")
         assert events[-1].type == "done"
     finally:
         await agent.close()

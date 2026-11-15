@@ -1,49 +1,48 @@
 """``LioriumAgent`` —— 一个类，三个正交维度（身份 / 关系 / 权限）。
 
-计划 §B1/§B2/§B4/§B5/§3.2：
+计划依据：``__dev__/Liorium Event 事件流原生 定稿.md``。
 
 - 身份：``id`` / 根目录 / 记忆 / checkpoint
-- 关系：``parent`` / ``lifecycle_owner`` / ``accepts_external_turns``（由调用方决定谁 run 它）
+- 关系：``parent`` / ``lifecycle_owner`` / ``accepts_external_turns``
 - 权限：谁能中断 / 配置（v1 不做权限系统，保留端口）
 
-生命周期语义收敛成 4 个显式操作：``start`` / ``close`` / ``run`` / ``apply``（+ ``reset_dialog``）。
-**身份不变 ⇒ 实例永不重建**，``apply()`` 只原位替换可变部件。
+**事件流原生**（2026-11-12 起）：Agent 是**自持 worker**——
 
-2026-11-08 起没有「宿主端口」：``run()`` 返回的生成器是**唯一**事件出口（只产出这一个
-回合的事件），排队 / 抢占 / 丢弃全在 ``TurnScheduler`` 里，跨 Agent 的并发由调用方自己管。
+- 外部只能 ``push()`` 投递入站条目、``stream()`` 观察全局只读事件流、
+  ``inject()`` 走底层 Context 通道；
+- 回合的创建、调度、取消全部由 Agent 内部（``TurnWorker``）裁决；
+- 发布者永不等待消费者（``EventHub`` 每订阅者一条无界队列，``put_nowait``）。
+
+生命周期仍是显式操作：``start`` / ``close`` / ``push`` / ``stream`` / ``apply``。
+**身份不变 ⇒ 实例永不重建**，``apply()`` 只原位替换可变部件。
 """
 
 from __future__ import annotations
 
 import asyncio
-import itertools
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Mapping, Sequence
 
-from liorium.core.errors import (
-    SpecError,
-    ToolNameConflictError,
-    TurnError,
-    TurnInterrupted,
-)
+from liorium.core.errors import SpecError, ToolNameConflictError, TurnError
 from liorium.core.log import get_logger
-from liorium.core.types import ContextItem, Event
+from liorium.core.types import ContextItem, Event, ev_input
 from liorium.vfs.fs import VirtualFileSystem
 
 from .context import ContextChannel
-from .realm.base import RealmTaskScope, TurnInfo
-from .realm.manager import RealmFactory, RealmManager
+from .realm.base import RealmMessage, TurnInfo
+from .realm.hooks import hook_middleware
+from .realm.host import RealmHostPort
+from .realm.manager import CURRENT_REALM_MESSAGE, RealmFactory, RealmManager
 from .realm.subagent import SubagentRealm
-from .runtime.scheduler import DEFAULT_FLAGS, FLAG, TurnScheduler
-from .runtime.types import TurnRequest, TurnRuntime
+from .runtime.hub import EventHub
+from .runtime.inbox import BatchWindow, Bucket, Entry, Flag, Inbox
+from .runtime.worker import TurnWorker
 from .spec import AgentSpec
 from .status import AgentStatus, ApplyResult, CacheEpoch
 
 log = get_logger("liorium.agent")
-
-_SENTINEL = object()
 
 
 def _same_callable(left: Callable[..., Any], right: Callable[..., Any]) -> bool:
@@ -67,8 +66,8 @@ def _same_callable(left: Callable[..., Any], right: Callable[..., Any]) -> bool:
 class _TurnEmitter:
     """可换目标的回合事件出口（压缩中间件在编译期就要拿到它）。
 
-    同一时刻只允许绑一个出口：``run()`` 是唯一事件通道，压进错回合的队列就是
-    "别的消息的事件串了"。绑定冲突（理论上只会在内部不变量被破坏时出现）记日志
+    同一时刻只允许绑一个出口（常驻 worker 串行跑回合，压进错回合的队列就是
+    "别的消息的事件串了"）。绑定冲突（理论上只会在内部不变量被破坏时出现）记日志
     并覆盖；解绑是**条件解绑**（只有当前绑的仍是本回合的 ``fn`` 才清空，按调用目标
     比较，不按 bound method 对象身份），这样旧回合收尾不会把新回合的出口一起关掉。
     """
@@ -124,7 +123,8 @@ class LioriumAgent:
         api_format: str | None = None,
         checkpoint_path: Path | None = None,
         thread_id: str | None = None,
-        priority: int = 0,
+        batch_window: BatchWindow | None = None,
+        env_interval: float = 30.0,
         system_prompt_override: str | None = None,
         tool_names: Sequence[str] | None = None,
     ) -> None:
@@ -146,8 +146,6 @@ class LioriumAgent:
         # 顶层 Agent 默认 thread_id="main"：旧 checkpoint.db 的 thread 就叫 main，
         # 这样才能"加载旧库继续对话"（计划 §3.7 / §F5）。子代理用自己的 id。
         self.thread_id = thread_id or ("main" if root_agent is None else spec.id)
-        self.priority = priority
-        """本 Agent 的默认调度优先级；``run(priority=...)`` 可按次覆盖。"""
         self.system_prompt_override = system_prompt_override
         self._tool_names: tuple[str, ...] | None = (
             None if tool_names is None else tuple(str(n).strip() for n in tool_names if str(n).strip())
@@ -173,6 +171,9 @@ class LioriumAgent:
             context_channel=self.context_channel,
             # 子 Agent：从树根借用 `instance_scope="tree"` 的 realm（同一实例/状态/挂载）。
             parent=self._tree_root.realms if root_agent is not None else None,
+            # realm 主动推送的端口（2026-11-14）：`ctx.emit/push/interrupt/turn`。
+            # 用工厂而不是实例：端口要绑定 realm_id，而 realm 在 start() 时才逐一起。
+            host_factory=self._make_realm_host,
         )
 
         from .runtime.checkpoint import CheckpointStore
@@ -184,11 +185,12 @@ class LioriumAgent:
         if self.artifacts is None:
             self.artifacts = OutputStore(root=spec.inbox_dir / "artifacts")
         # realm 的运行时上下文（workspace root / artifacts / spec）在这里定稿：
-        # 不进 RealmSpec.params（params 参与指纹，绝对路径会污染它）。
+        # 不进 RealmSpec.config（config 参与指纹，绝对路径会污染它）。
         self.realms.configure(
             agent_spec=spec,
             workspace_root=spec.effective_workspace_root,
             artifacts=self.artifacts,
+            aux_model_factory=lambda: self._aux_for(spec),
         )
 
         self._started = False
@@ -200,18 +202,16 @@ class LioriumAgent:
         self._compact: Any = None
         self._epoch = CacheEpoch()
         self._emitter = _TurnEmitter()
-        self._turn_seq = itertools.count(1)
-        self._current_turn_id: str | None = None
-        self._turn_task: asyncio.Task[Any] | None = None
-        self._turn_scope: RealmTaskScope | None = None
-        self._interrupt = asyncio.Event()
-        self._turn_reason = ""
         self._message_count = 0
         self._subagent_realm: SubagentRealm | None = None
         self._artifacts_mount_owned = False
         self._warned_compact_disabled = False
 
-        self._scheduler = TurnScheduler()
+        # 入站队列 / 扇出中心 / 常驻 worker（定稿 §1：worker 拥有回合）
+        # ``env_interval``：``ENVIRONMENT`` 回合中途投递的最小间隔（秒，<=0 表示每次安全点都投）。
+        self._inbox = Inbox(batch_window=batch_window, env_interval=env_interval)
+        self._hub = EventHub()
+        self._worker = TurnWorker(self, inbox=self._inbox, hub=self._hub)
 
     # ------------------------------------------------------------------
     # 属性
@@ -249,7 +249,7 @@ class LioriumAgent:
     async def start(self) -> None:
         """建 VFS / 起 realm / 开 checkpoint / 建图 / 播种 system 消息。
 
-        **不调模型**（计划 §F7）：首次引导由调用方 ``run(boot.message)``。
+        **不调模型**（计划 §F7）：首次引导由调用方 ``push(boot.message, id=...)``。
         """
         if self._started:
             return
@@ -268,12 +268,34 @@ class LioriumAgent:
         await self._mount_artifacts()
         await self._build_runtime()
         self._started = True
+        self._worker.start()
         log.info("agent 启动: %s（realm=%s）", self.spec.id, self.realms.order)
 
     def _make_subagent_realm(self, realm_spec: Any) -> SubagentRealm:
-        realm = SubagentRealm(parent=self, params=dict(realm_spec.params))
+        realm = SubagentRealm(parent=self, config=dict(realm_spec.config))
         self._subagent_realm = realm
         return realm
+
+    def _make_realm_host(self, realm_id: str) -> RealmHostPort:
+        """给一个 realm 建宿主端口（``RealmManager.start()`` 时逐个调用）。"""
+        return RealmHostPort(self, realm_id)
+
+    def _aux_for(self, spec: AgentSpec) -> Any:
+        """realm 的 aux 模型（``ctx.model``）：优先 compact 工厂（不思考、无工具）。
+
+        返回实例而不是缓存：「谁造谁关」归工厂；``apply()`` 换模型后下一次访问自然拿到新的。
+        """
+        factory = self.compact_model_factory or self.model_factory
+        return factory(spec.model)
+
+    def _hook_middleware(self, realm_id: str, instance: Any) -> Any:
+        """只读钩子的适配器：没覆盖钩子的 realm 返回 ``None``（不装空转中间件）。"""
+        return hook_middleware(
+            instance,
+            realm_id=realm_id,
+            model=self.spec.model,
+            turn_info=lambda: self._worker.current_turn_info,
+        )
 
     async def _mount_artifacts(self) -> None:
         """把 OutputStore 投影到 VFS 的 ``/artifacts``（``artifact://`` 的真实入口）。
@@ -343,11 +365,13 @@ class LioriumAgent:
     async def close(self) -> None:
         if self._closed:
             return
+        if CURRENT_REALM_MESSAGE.get() is not None:
+            # close() 要停 realm（等 record.send_lock），而 handler 正持着它 ⇒ 互锁
+            raise TurnError("不能在 realm 消息处理（on_message）里 close() agent")
         self._closed = True
+        # 收当前回合（interrupted(close)）/ 丢 pending / 关流 / 停 worker
+        await self._worker.close()
         self._started = False
-        await self.interrupt(reason="agent_close")
-        # 排队中的 run() 不能永远睡在 scheduler 上
-        self._scheduler.reset()
         try:
             if self._subagent_realm is not None:
                 await self._subagent_realm.shutdown()
@@ -358,6 +382,26 @@ class LioriumAgent:
                 self._artifacts_mount_owned = False
             await self.checkpoint.close()
             self._graph = None
+            await self._aclose_factories()
+
+    async def _aclose_factories(self) -> None:
+        """关掉工厂自带的客户端池（``ChatModelPool.aclose``）；裸函数工厂没有这个方法。
+
+        「谁造谁关」：Agent 只调工厂的 ``aclose``，**不**对模型实例做鸭子类型关闭
+        （那会关掉 langchain 模块级 ``lru_cache`` 里的共享客户端，同 base_url 的模型全废）。
+        去重 + 幂等：``.chat`` / ``.compact`` 可能指向同一个 pool。
+        """
+        closed: set[int] = set()
+        for factory in (self.model_factory, self.compact_model_factory):
+            if factory is None or id(factory) in closed:
+                continue
+            closed.add(id(factory))
+            aclose = getattr(factory, "aclose", None)
+            if callable(aclose):
+                try:
+                    await aclose()
+                except Exception as exc:  # noqa: BLE001 - 关闭失败不能拖垮 close()
+                    log.warning("关闭模型工厂失败: %s", exc)
 
     # ------------------------------------------------------------------
     # 装配
@@ -453,8 +497,12 @@ class LioriumAgent:
         chain = build_chain(
             artifacts=self.artifacts,
             compact=compact,
-            realm_middlewares=self.realms.realm_middlewares(),
+            # realm 自己的中间件 + 只读钩子适配器（每个 realm：middleware 在外、钩子紧随）
+            realm_middlewares=self.realms.realm_middlewares(hook_factory=self._hook_middleware),
             context_channel=self.context_channel,
+            on_context_materialized=self._worker.on_context_materialized,
+            # 回合进行中按 env_interval 节流注入 ENVIRONMENT（不开回合、不打扰模型）。
+            env_context=self._worker.pull_env_context,
         )
 
         saver = await self.checkpoint.open()
@@ -569,88 +617,142 @@ class LioriumAgent:
         )
 
     # ------------------------------------------------------------------
-    # run / inject / interrupt
+    # 入站 / 出站（事件流原生）
     # ------------------------------------------------------------------
 
-    def run(
+    def push(
         self,
         text: str,
         *,
-        context: Sequence[ContextItem] = (),
+        id: str,
+        bucket: Bucket = Bucket.MAJOR,
+        flags: Flag = Flag.NONE,
         origin: str = "user",
-        priority: int | None = None,
-        flags: FLAG = DEFAULT_FLAGS,
-    ) -> AsyncIterator[Event]:
-        """跑一个回合，返回**只属于这一条消息**的异步事件流。
+        timeout: float | None = None,
+        context: Sequence[ContextItem] = (),
+    ) -> None:
+        """投递一条入站条目：**同步、无返回值、入队即返回**。
 
-        - 迭代结束 = 回合结束；错误以异常抛出（``TurnInterrupted`` / ``TurnError`` /
-          ``TurnDropped``）；
-        - ``priority=None`` 用本 Agent 的默认优先级（``self.priority``）；整数**越大越优先**，
-          同优先级 FIFO；
-        - ``flags`` 见 :class:`liorium.agent.FLAG`：``INTERRUPTING`` 可抢占正在跑的低优先级
-          回合、``EXCLUSIVE`` 拒绝被抢占、``DROPPABLE`` 拥塞时可被丢弃；
-        - 等待执行位期间**不产出任何事件**；不向任何别的消费者扇出（没有宿主 sink）。
+        - ``id`` 必填，是事件流的关联键（``push`` 没有返回值，这是唯一关联手段）；
+        - ``bucket`` 只表达"何时投递"（见 :class:`Bucket`）：
+          ``IMMEDIATE``/``MAJOR`` 入队即排回合，``BATCHED`` 攒满合批窗口后**开自己的
+          回合**（回合在跑就排队等它结束），``ENVIRONMENT`` 永不开回合、只做 context；
+        - ``flags`` 见 :class:`Flag`：``AUTO``（空闲开回合 / 忙碌注入当前回合，仅
+          ``MAJOR`` 有意义，与 ``IMMEDIATE`` 互斥 ⇒ ``ValueError``）、``EXCLUSIVE``
+          （本条开启的回合拒绝被 ``IMMEDIATE`` 抢占）、``DROPPABLE``（深度达
+          ``QUEUE_MAX`` 时丢弃并发 ``input.dropped``）；
+        - ``timeout`` 是**消费截止时间**（秒，monotonic）：条目在被物化进消息之前到期
+          即作废，永不物化，发 ``input.expired``；
+        - ``context`` 并入本回合的 user 消息（退回形态①）。
+
+        节奏控制（什么时候该开口）**不属于 Core**：VTuber 场景由适配器自己的合批
+        缓冲 + 开口闸门在 ``push`` 之前完成（定稿 §10）。
         """
+        if self._closed:
+            raise TurnError("agent 已 close，不能 push()")
         if not self._started or self._graph is None:
-            raise TurnError("agent 未 start()，不能 run()")
-        effective = self.priority if priority is None else int(priority)
-        return self._run_iter(
-            text,
-            context=tuple(context),
-            origin=origin,
-            priority=effective,
-            flags=FLAG(flags),
-        )
+            raise TurnError("agent 未 start()，不能 push()")
+        if not id:
+            raise ValueError("push() 的 id 不能为空")
 
-    async def _run_iter(
-        self,
-        text: str,
-        *,
-        context: Sequence[ContextItem],
-        origin: str,
-        priority: int,
-        flags: FLAG,
-    ) -> AsyncIterator[Event]:
-        index = next(self._turn_seq)
-        turn_id = f"{self.spec.id}#{index}"
-        # 先拿回合位，再做 reconcile：并发 run() 时第二个回合不能在第一回合还在
-        # 流式输出/执行工具时 stop_all()/start_all()、替换 graph、抢 pending context。
-        await self._scheduler.acquire(
-            priority=priority,
+        bucket = Bucket(bucket)
+        flags = Flag(flags)
+        if flags & Flag.AUTO and bucket is Bucket.IMMEDIATE:
+            raise ValueError("Flag.AUTO 与 Bucket.IMMEDIATE 互斥")
+        items = tuple(context)
+
+        if flags & Flag.AUTO and bucket is Bucket.MAJOR and self._worker.turn_running:
+            # AUTO + 忙碌 ⇒ 注入当前回合的 context（安全点物化），不开新回合。
+            self._worker.forget_delivered(id)
+            self.context_channel.queue(
+                [ContextItem(source=origin, text=text, meta={"input_id": id}), *items]
+            )
+            self._hub.publish(ev_input(id, "accepted"))
+            return
+
+        entry = Entry(
+            id=id,
+            text=text,
+            bucket=bucket,
             flags=flags,
-            tag=turn_id,
-            on_preempt=self._signal_preempt,
+            origin=origin,
+            timeout=timeout,
+            context=items,
         )
-        try:
-            if self._closed or not self._started:
-                raise TurnError("agent 已 close，不能 run()")
-            self._current_turn_id = turn_id
-            self._interrupt.clear()
-            self._turn_reason = ""
-            if self.parent is None:
-                # 子代理的 spec 由父固定，不做回合边界 realm 刷新（它的 realm 集合是空的，
-                # 而且重建会把父的 spec 套到子代理身份上）。
-                await self._reconcile_realms()
-            if self._interrupt.is_set():
-                raise TurnInterrupted(reason=self._turn_reason or "interrupt")
-            # 回合开始时到达的 context：并入该回合 user 消息（形态①，计划 §4.3）
-            merged_context = tuple(context) + tuple(self.context_channel.take_pending())
-            # 第五拍：到期才问；排到下一个安全点物化成独立 <context> user 消息（形态②）。
-            realm_context = await self._context_for_turn(index, turn_id, origin)
-            if realm_context:
-                self.context_channel.queue(realm_context)
-            stream = self._drive_turn(turn_id, text, merged_context, origin)
-            try:
-                async for event in stream:
-                    yield event
-            finally:
-                # 消费者中途放弃时 ``async for`` 不会关内层生成器，它的
-                # ``finally``（解绑出口 / 取消本回合任务）会推迟到异步终结器，
-                # 那时下一个回合可能已经在跑。显式 aclose：先收尾，再让外层 release。
-                await stream.aclose()
-        finally:
-            self._current_turn_id = None
-            self._scheduler.release()
+        outcome = self._inbox.push(entry)
+        self._hub.publish(ev_input(id, "accepted" if outcome == "accepted" else "dropped"))
+        if outcome != "accepted":
+            return
+        # 同 id 复用（旧的已物化 / 已被替换）：新条目要有自己的 input.delivered。
+        self._worker.forget_delivered(id)
+        self._worker.wake()
+        if bucket is Bucket.IMMEDIATE and self._worker.turn_running:
+            self._worker.notify_immediate()
+
+    def stream(self, *, ids: Sequence[str] | None = None) -> AsyncIterator[Event]:
+        """打开一条只读事件流：**可开多个**，彼此独立，每个都是完整视图。
+
+        - ``stream()`` 本身只构造订阅对象；真正的订阅发生在 ``__aiter__``
+          （``async for`` 开始那一刻），所以 ``s = agent.stream()`` 之后不迭代不会泄漏；
+        - **不回放**：从订阅时刻起的事件，没有历史、没有快照；
+        - ``ids=[...]``：只产出 ``start.inputs`` 与该集合有交集的回合的帧，以及这些
+          id 自己的 ``input`` 生命周期帧；
+        - 订阅者慢 / 抛错 / ``aclose`` 只影响它自己；**没人订阅时 Agent 照常跑回合**。
+        """
+        return self._hub.subscribe(ids=ids)
+
+    def inject(self, items: Sequence[ContextItem] | ContextItem) -> None:
+        """底层 Context 通道：**永不打断**，在下一个安全点（或下一回合开始）物化。
+
+        不经 Inbox、不参与 bucket/timeout/合批、不发 ``input`` 帧 —— 这是 realm
+        内部 ``ctx.inject()`` 的宿主侧对应物、库内部注入与测试用的旁路。
+        """
+        if isinstance(items, ContextItem):
+            items = [items]
+        self.context_channel.queue(list(items))
+
+    async def interrupt(self, *, reason: str = "user") -> bool:
+        """取消当前回合（模型流 / 工具执行 / 本回合托管任务）；队列保留。"""
+        return self._worker.interrupt(reason or "user")
+
+    async def send_to_realm(
+        self,
+        realm_id: str,
+        name: str,
+        data: Mapping[str, Any] | None = None,
+        *,
+        origin: str = "host",
+        timeout: float | None = None,
+    ) -> Any:
+        """把一条消息交给运行中的 realm，等它处理完并返回 handler 的返回值（2026-11-14）。
+
+        这是**宿主 → realm** 的公共入口：外部主程序（GUI / webhook / cron）改一条待办、
+        送来一条领域事件，不需要模型参与，也不需要等 50 回合的周期上下文。
+
+        ```python
+        reply = await agent.send_to_realm("todo", "todo.add", {"text": "写 demo"})
+        ```
+
+        - **立即执行**：不排队、不等当前回合结束（与正在跑的回合并发）⇒ handler 必须廉价，
+          慢活自己 ``ctx.spawn``；同 realm 的消息彼此串行（``record.send_lock``）；
+        - **等结果**：handler 的返回值原样返回；返回值 ``None`` 也合法（纯事件通知）；
+        - realm 侧由 ``BaseRealm.on_message()`` 接收（默认为"不接受消息"，抛 ``RealmError``）；
+        - 错误：未 ``start()`` / 已 ``close()`` ⇒ ``TurnError``；未装配 ⇒
+          ``RealmNotFoundError``；状态不是 ``running``（被 ``/realm disable`` 或启动失败）⇒
+          ``RealmError``；handler 抛的异常原样上抛；``timeout`` 到期 ⇒ ``RealmError``；
+        - `instance_scope="tree"` 的 realm 由**树根那份实例**处理（子 Agent 的 record 就是
+          根的那条），所以它的 ``ctx.emit`` / ``ctx.push`` 都落在根 Agent 上；
+        - 消息不进事件流、不进历史、不影响 prompt / 指纹 —— 想广播就让 handler 自己
+          ``ctx.emit(...)``（会落成 ``realm`` 帧）；
+        - handler 里**不要**调 ``refresh_realms`` / ``set_realm_enabled`` / ``reset_dialog`` /
+          ``close``（会抛 ``TurnError``：那些操作要维护队列，而消息正持着 realm 锁）。
+        """
+        if self._closed:
+            raise TurnError("agent 已 close，不能 send_to_realm()")
+        if not self._started or self._graph is None:
+            raise TurnError("agent 未 start()，不能 send_to_realm()")
+        message = RealmMessage(realm_id=realm_id, name=name, data=data or {}, origin=origin)
+        return await self.realms.send(realm_id, message, timeout=timeout)
 
     async def _context_for_turn(self, index: int, turn_id: str, origin: str) -> list[ContextItem]:
         """第五拍：问各 realm「本回合有要注入的吗」；节拍器自身出 bug 不该炸回合。"""
@@ -685,140 +787,6 @@ class LioriumAgent:
         except Exception as exc:  # noqa: BLE001
             log.error("realm 刷新后重建运行时失败，继续用旧运行时: %s", exc, exc_info=exc)
 
-    async def _drive_turn(
-        self,
-        turn_id: str,
-        text: str,
-        context: Sequence[ContextItem],
-        origin: str,
-    ) -> AsyncIterator[Event]:
-        queue: asyncio.Queue[Any] = asyncio.Queue()
-        # bound method 每次访问都是新对象：只取一次，bind/unbind/emit 用同一个。
-        emit = queue.put
-        scope = RealmTaskScope(log_name=f"turn.{turn_id}")
-        self._turn_scope = scope
-
-        request = TurnRequest(
-            agent_id=self.spec.id,
-            turn_id=turn_id,
-            text=text,
-            context=context,
-            origin=origin,
-        )
-        runtime = TurnRuntime(
-            spec=self.spec,
-            graph=self._graph,
-            checkpointer=self.checkpoint.saver,
-            model=self._model,
-            tools=self._tools,
-            middleware=self._middleware,
-            artifacts=self.artifacts,
-            vfs=self.vfs,
-            emit=emit,
-            interrupt=self._interrupt,
-            tasks=scope,
-            thread_id=self.thread_id,
-            api_format=self.api_format,
-            extra={"context_channel": self.context_channel},
-        )
-        self._emitter.bind(emit)
-
-        from .runtime.loop import execute_turn
-
-        error: BaseException | None = None
-
-        async def _produce() -> None:
-            nonlocal error
-            try:
-                async for event in execute_turn(runtime, request):
-                    await queue.put(event)
-            except BaseException as exc:  # noqa: BLE001 - 原样带回消费者
-                error = exc
-            finally:
-                await queue.put(_SENTINEL)
-
-        task = scope.spawn(_produce(), name=f"turn:{turn_id}")
-        self._turn_task = task
-        seen_done = False
-        try:
-            while True:
-                get_task = asyncio.ensure_future(queue.get())
-                waiters: set[Any] = {get_task}
-                waiters.add(task)
-                done, _pending = await asyncio.wait(
-                    waiters, return_when=asyncio.FIRST_COMPLETED
-                )
-                if get_task in done:
-                    item = get_task.result()
-                else:
-                    get_task.cancel()
-                    # 生产者已结束但没有哨兵（被取消时）：把队列里剩下的取完再退出
-                    if queue.empty():
-                        break
-                    item = queue.get_nowait()
-                if item is _SENTINEL:
-                    break
-                if self._interrupt.is_set():
-                    # 中断后不再转发残余事件（终结语义 = 迭代结束 + 异常）
-                    continue
-                if getattr(item, "type", None) == "done":
-                    seen_done = True
-                yield item
-        finally:
-            self._emitter.unbind(emit)
-            try:
-                await scope.cancel_all(timeout=5.0)
-            finally:
-                # 只清自己的：更晚收尾的旧回合不许抹掉新回合的字段。
-                if self._turn_scope is scope:
-                    self._turn_scope = None
-                if self._turn_task is task:
-                    self._turn_task = None
-                try:
-                    snapshot = await self._graph.aget_state(self._thread_config())
-                    self._message_count = len(
-                        (getattr(snapshot, "values", None) or {}).get("messages") or []
-                    )
-                except Exception:  # noqa: BLE001 - 统计失败不影响回合结果
-                    pass
-
-        if self._interrupt.is_set() and not seen_done:
-            raise TurnInterrupted(reason=self._turn_reason or "interrupt")
-        if error is not None:
-            if isinstance(error, (TurnInterrupted, TurnError)):
-                raise error
-            raise TurnError(f"回合失败: {error}", cause=error) from error
-
-    async def inject(self, items: Sequence[ContextItem]) -> None:
-        """运行中注入，**永不打断**：排队到下一个安全点物化成独立 user 消息。"""
-        if isinstance(items, ContextItem):
-            items = [items]
-        self.context_channel.queue(list(items))
-
-    async def interrupt(self, *, reason: str = "") -> bool:
-        """取消当前回合（模型流 / 工具执行 / 本回合托管任务）。"""
-        if not self._signal_preempt(reason):
-            return False
-        if self._turn_scope is not None:
-            await self._turn_scope.cancel_all(timeout=5.0)
-        return True
-
-    def _signal_preempt(self, reason: str) -> bool:
-        """同步打断当前回合：``interrupt()`` 与调度器抢占共用这一条路径。
-
-        返回是否真的有回合被打断。执行位被维护操作（``apply`` / ``reset_dialog`` …）
-        占着时 ``_current_turn_id`` 是 ``None``，此时抢占者只会排队 —— 不会因为
-        "抢不到"而报错。
-        """
-        if self._current_turn_id is None:
-            return False
-        self._turn_reason = reason
-        self._interrupt.set()
-        task = self._turn_task
-        if task is not None and not task.done():
-            task.cancel()
-        return True
-
     # ------------------------------------------------------------------
     # apply / reset
     # ------------------------------------------------------------------
@@ -835,13 +803,13 @@ class LioriumAgent:
         变了，例如思考强度；spec 本身仍是同一个标签）。
         """
         self._assert_maintenance_allowed()
-        await self._scheduler.acquire(priority=self.priority, tag="apply")
-        try:
+
+        async def _do() -> ApplyResult:
             if self._closed:
                 raise TurnError("agent 已 close，不能 apply()")
             return await self._apply_locked(spec, force=force)
-        finally:
-            self._scheduler.release()
+
+        return await self._worker.run_maintenance(_do, name="apply")
 
     async def _apply_locked(self, spec: AgentSpec, *, force: bool = False) -> ApplyResult:
         """真正的 apply 实现；调用方必须保证没有并发回合。"""
@@ -851,6 +819,14 @@ class LioriumAgent:
             raise SpecError("AgentSpec.inbox_dir 是身份的一部分，不能通过 apply 改变")
 
         old = self.spec
+        # aux 工厂跟着**目标** spec 走：即使只换模型、不重启 realm，``ctx.model`` 也必须
+        # 拿到新模型（closure 捕获 spec，而不是 self.spec —— 后者要等运行时提交后才变）。
+        self.realms.configure(
+            agent_spec=spec,
+            workspace_root=spec.effective_workspace_root,
+            artifacts=self.artifacts,
+            aux_model_factory=lambda: self._aux_for(spec),
+        )
         old_parts = old.part_fingerprints()
         new_parts = spec.part_fingerprints()
         changed = tuple(k for k in new_parts if old_parts.get(k) != new_parts[k])
@@ -870,12 +846,6 @@ class LioriumAgent:
                 # 调用方可能在 start() 之后才注册 realm 工厂（MCP/插件式发现），
                 # apply 时同步一次，避免"新 realm 找不到工厂"
                 self.realms.factories.update(self.realm_factories)
-                # realm 的运行时上下文跟着新 spec 走（workspace root 可能变了）
-                self.realms.configure(
-                    agent_spec=spec,
-                    workspace_root=spec.effective_workspace_root,
-                    artifacts=self.artifacts,
-                )
                 # 先停旧 realm：它的挂载/后台任务必须先撤掉，否则新 realm 挂同一前缀
                 # 会 MountConflictError，而且旧挂载会变成指向旧实例的幽灵投影。
                 await self.realms.stop_all()
@@ -931,6 +901,7 @@ class LioriumAgent:
                 agent_spec=old,
                 workspace_root=old.effective_workspace_root,
                 artifacts=self.artifacts,
+                aux_model_factory=lambda: self._aux_for(old),
             )
             self.realms.assemble(old.realms)
             await self.realms.start_all()
@@ -946,15 +917,21 @@ class LioriumAgent:
 
     def _assert_maintenance_allowed(self) -> None:
         """维护操作（refresh/reset）不能从当前回合内部重入，否则会自锁。"""
-        if self._turn_task is not None and asyncio.current_task() is self._turn_task:
+        if self._worker.in_turn_task():
             raise TurnError("不能在当前回合内部调用 refresh_realms()/reset_dialog()")
+        if CURRENT_REALM_MESSAGE.get() is not None:
+            # realm 消息 handler 持着 record.send_lock；维护操作要等维护队列 ⇒ 必然互锁
+            raise TurnError(
+                "不能在 realm 消息处理（on_message）里调用 refresh_realms()/"
+                "set_realm_enabled()/reset_dialog()"
+            )
 
     async def refresh_realms(self, *, force: bool = True) -> bool:
         """调用方主动触发 realm 刷新（回合边界之外）；返回是否真的刷新过。
 
         与回合边界自动 reconcile 的区别：这里由**调用方**决定时机。典型场景是调用方
         刚做完一件它自己知道真相源变了的事（装了技能、另一个进程写了记忆库、MCP
-        服务器上线），不想等到下一次 ``run()``。
+        服务器上线），不想等到下一次 ``push()`` 触发的回合边界。
 
         ``force=True``（默认）先对所有支持 ``mark_dirty()`` 的 realm 置脏 —— 调用方
         已经知道变了，不必等 mtime/revision 比对；``force=False`` 只刷新自报脏的。
@@ -966,9 +943,8 @@ class LioriumAgent:
         if not self._started or self._graph is None:
             raise TurnError("agent 未 start()，不能 refresh_realms()")
         self._assert_maintenance_allowed()
-        # 与回合并发地 stop/start realm 会让运行中的 graph 指向被停实例；排队。
-        await self._scheduler.acquire(priority=self.priority, tag="refresh_realms")
-        try:
+
+        async def _do() -> bool:
             if self._closed:
                 raise TurnError("agent 已 close，不能 refresh_realms()")
             if force:
@@ -978,8 +954,9 @@ class LioriumAgent:
                 await self._build_runtime()
                 log.info("调用方触发 realm 刷新: epoch=%s", self._epoch.value)
             return changed
-        finally:
-            self._scheduler.release()
+
+        # 与回合并发地 stop/start realm 会让运行中的 graph 指向被停实例；插队执行。
+        return await self._worker.run_maintenance(_do, name="refresh_realms")
 
     async def set_realm_enabled(self, realm_id: str, enabled: bool) -> bool:
         """开/关一个已装配的 realm，并重建运行时（工具 / prompt / 中间件同步变化）。
@@ -995,9 +972,8 @@ class LioriumAgent:
         if not self._started or self._graph is None:
             raise TurnError("agent 未 start()，不能 set_realm_enabled()")
         self._assert_maintenance_allowed()
-        # 与回合并发地 stop/start realm 会让运行中的 graph 指向被停实例；排队。
-        await self._scheduler.acquire(priority=self.priority, tag="set_realm_enabled")
-        try:
+
+        async def _do() -> bool:
             if self._closed:
                 raise TurnError("agent 已 close，不能 set_realm_enabled()")
             record = self.realms.record(realm_id)
@@ -1025,29 +1001,33 @@ class LioriumAgent:
                 self._epoch.value,
             )
             return record.state == "running"
-        finally:
-            self._scheduler.release()
+
+        # 与回合并发地 stop/start realm 会让运行中的 graph 指向被停实例；插队执行。
+        return await self._worker.run_maintenance(_do, name="set_realm_enabled")
 
     async def reset_dialog(self) -> None:
         """清空对话 + 重写 system 段（不调模型）。
 
-        ``state_scope="conversation"`` 的 realm 状态随对话一起重置（v1.1）。
+        执行前清空 Inbox 里全部条目并逐条发 ``input.dropped`` —— 它们属于被清掉的
+        对话（定稿 §5.5）。``state_scope="conversation"`` 的 realm 状态随对话一起重置。
         """
         if self._graph is None:
             raise TurnError("agent 未 start()")
         self._assert_maintenance_allowed()
-        await self._scheduler.acquire(priority=self.priority, tag="reset_dialog")
-        try:
+
+        async def _do() -> None:
             if self._closed:
                 raise TurnError("agent 已 close，不能 reset_dialog()")
+            for entry in self._inbox.clear():
+                self._hub.publish(ev_input(entry.id, "dropped"))
             prompt = self._prompt.text if getattr(self, "_prompt", None) is not None else ""
             await self.checkpoint.reset_dialog(self._graph, self._thread_config(), prompt)
             await self.realms.reset_conversation_state()
             reset_artifacts = getattr(self.artifacts, "reset", None)
             if callable(reset_artifacts):
                 reset_artifacts()
-        finally:
-            self._scheduler.release()
+
+        await self._worker.run_maintenance(_do, name="reset_dialog")
 
     # ------------------------------------------------------------------
     # status
@@ -1056,14 +1036,18 @@ class LioriumAgent:
     def status(self) -> AgentStatus:
         return AgentStatus(
             agent_id=self.spec.id,
-            running=self._current_turn_id is not None,
-            turn_id=self._current_turn_id,
-            queue_depth=self._scheduler.queue_depth(),
+            running=self._worker.turn_running,
+            turn_id=self._worker.current_turn_id,
+            queue_depth=self._inbox.depth(),
             spec_fingerprint=self.spec.fingerprint(),
             epoch=self._epoch,
             realms=tuple(self.realms.status()),
             messages=self._message_count,
             pending_context=self.context_channel.pending_count(),
+            pending_by_bucket=tuple(
+                (bucket.name, count)
+                for bucket, count in self._inbox.depth_by_bucket().items()
+            ),
             started=self._started,
             closed=self._closed,
         )

@@ -9,7 +9,7 @@ import pytest
 from langchain_core.messages import AIMessage
 
 from liorium.agent import AgentSpec, Limits, RealmSpec, LioriumAgent
-from liorium_testkit import make_scripted_factory
+from liorium_testkit import collect_turn, make_scripted_factory
 
 
 def make_parent(workspace: Path, responses: list) -> tuple[LioriumAgent, object]:
@@ -176,7 +176,7 @@ async def test_parent_unaffected_by_child_error(agent_workspace: Path) -> None:
         assert record.status == "error"
 
         agent.model_factory = lambda _label: model
-        events = [e async for e in agent.run("还在吗")]
+        events = await collect_turn(agent, "还在吗")
         assert events[-1].type == "done"
     finally:
         await agent.close()

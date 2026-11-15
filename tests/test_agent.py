@@ -19,7 +19,7 @@ from pathlib import Path
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from liorium_testkit import make_scripted_factory
+from liorium_testkit import collect_turn, make_scripted_factory
 from liorium.agent import AgentSpec, Limits, LioriumAgent
 from liorium.core.types import ContextItem, ev_done
 from liorium.vfs.fs import VirtualFileSystem
@@ -69,10 +69,9 @@ async def graph_messages(agent: LioriumAgent) -> list:
 
 
 async def collect(agent: LioriumAgent, text: str, **kwargs) -> list:
-    events = []
-    async for event in agent.run(text, **kwargs):
-        events.append(event)
-    return events
+    """收齐一个回合的事件；过滤入站生命周期帧，保持旧的 ``start → done`` 形态。"""
+    events = await collect_turn(agent, text, **kwargs)
+    return [event for event in events if event.type != "input"]
 
 
 @pytest.mark.asyncio
@@ -132,7 +131,7 @@ async def test_inject_queues_without_interrupt(agent_workspace: Path) -> None:
     agent, _model = make_agent(agent_workspace, ["好"])
     await agent.start()
     try:
-        await agent.inject([ContextItem(source="trigger:desktop", text="开始下雨了")])
+        agent.inject([ContextItem(source="trigger:desktop", text="开始下雨了")])
         assert agent.status().pending_context == 1
         events = await collect(agent, "在吗")
         assert [e.type for e in events][-1] == "done"
@@ -169,6 +168,37 @@ async def test_tool_cycle(agent_workspace: Path) -> None:
         assert types[-1] == "done"
         messages = await graph_messages(agent)
         assert any(isinstance(m, ToolMessage) for m in messages)
+    finally:
+        await agent.close()
+
+
+@pytest.mark.asyncio
+async def test_tool_argument_error_becomes_tool_result(agent_workspace: Path) -> None:
+    """工具抛异常（参数校验失败）也要在正确位置配对，不能变成 ``[已中断]``。
+
+    2026-11-12：``on_tool_error`` 以前没被翻译，``tool_start`` 悬到回合收尾才被
+    补成 ``[已中断]``，排在后续 delta 之后 —— 用户会以为是自己取消的。
+    """
+    bad_call = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "read", "args": {"path": "notes.txt"}, "id": "call_bad", "type": "tool_call"}
+        ],
+    )
+    agent, _model = make_agent(agent_workspace, [bad_call, "参数用错了。"])
+    await agent.start()
+    try:
+        events = await collect(agent, "读一下 notes.txt")
+        types = [e.type for e in events]
+        assert types[-1] == "done"
+
+        results = [e for e in events if e.type == "tool_result"]
+        assert len(results) == 1
+        output = str(results[0].get("output"))
+        assert output.startswith("[工具执行出错]")
+        assert "uri" in output  # 校验消息点名缺哪个字段
+        # 错误结果先配对，之后才是模型的正文
+        assert types.index("tool_result") < types.index("delta")
     finally:
         await agent.close()
 
@@ -350,27 +380,31 @@ async def test_artifact_uri_reads_full_output(agent_workspace: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_concurrent_runs_are_serialized(agent_workspace: Path) -> None:
-    """同一 Agent 并发 run()：第二个回合必须等第一个跑完，不能并发 reconcile。"""
+    """同一 Agent 同时投递两个回合：单执行位串行，第二个的 ``start`` 必在第一个终态之后。"""
     import asyncio
 
     agent, _model = make_agent(agent_workspace, ["第一", "第二"])
     await agent.start()
     try:
-        first = agent.run("a")
-        first_event = await asyncio.wait_for(first.__anext__(), timeout=2.0)
-        assert first_event is not None
+        subscription = agent.stream()
+        iterator = subscription.__aiter__()
+        agent.push("a", id="serial-a")
+        agent.push("b", id="serial-b")
 
-        second = agent.run("b")
-        pending = asyncio.ensure_future(second.__anext__())
-        await asyncio.sleep(0.05)
-        assert not pending.done(), "第二个回合在第一个回合结束前就开始了"
+        events_a = []
+        while True:
+            event = await asyncio.wait_for(iterator.__anext__(), timeout=2.0)
+            events_a.append(event)
+            if event.type in ("done", "interrupted", "error"):
+                break
+        assert events_a[-1].type == "done"
+        assert events_a[-1].get("turn_id") != ""
 
-        # 把第一个回合跑完
-        async for _event in first:
-            pass
-        event = await asyncio.wait_for(pending, timeout=2.0)
-        assert event is not None
-        await second.aclose()
+        # 第二条流的第一帧只能发生在第一个回合终态之后（发布顺序即执行顺序）
+        event = await asyncio.wait_for(iterator.__anext__(), timeout=2.0)
+        assert event.type == "start"
+        assert event.get("inputs") == ["serial-b"]
+        await subscription.aclose()
     finally:
         await agent.close()
 
@@ -402,13 +436,13 @@ async def test_apply_realm_impl_change_keeps_epoch(agent_workspace: Path) -> Non
     agent.realm_factories["weather"] = lambda spec: WeatherRealm(
         str(spec.params.get("answer", "晴"))
     )
-    agent.spec = replace(agent.spec, realms=(RealmSpec(id="weather", params={"answer": "晴"}),))
+    agent.spec = replace(agent.spec, realms=(RealmSpec(id="weather", config={"answer": "晴"}),))
     await agent.start()
     try:
         before = agent.epoch.value
         # 只改 realm 参数（工具 schema 不变）⇒ 重新装配，但 epoch 不该变
         new_spec = replace(
-            agent.spec, realms=(RealmSpec(id="weather", params={"answer": "雨"}),)
+            agent.spec, realms=(RealmSpec(id="weather", config={"answer": "雨"}),)
         )
         result = await agent.apply(new_spec)
         assert result.failed == ()
@@ -553,18 +587,26 @@ async def test_consecutive_turns_do_not_rebind_emitter(
 
 
 @pytest.mark.asyncio
-async def test_abandoned_turn_is_closed_before_release(
+async def test_abandoned_subscriber_does_not_stop_turn(
     agent_workspace: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """消费者中途 aclose：旧回合的收尾（解绑 / 取消任务）必须同步完成，不能落到下一回合里。"""
+    """订阅者中途 aclose 只摘掉它自己：回合照常跑完，不串到下一回合的出口绑定。"""
+    import asyncio
+
     agent, _model = make_agent(agent_workspace, ["第一", "第二"])
     await agent.start()
     try:
-        stream = agent.run("a")
-        await stream.__anext__()
-        await stream.aclose()
-        assert agent._turn_scope is None, "aclose 之后本回合的作用域应已清空"
-        assert agent._turn_task is None, "aclose 之后本回合的任务应已清空"
+        subscription = agent.stream()
+        iterator = subscription.__aiter__()
+        agent.push("a", id="abandon-a")
+        await asyncio.wait_for(iterator.__anext__(), timeout=2.0)
+        await subscription.aclose()
+        # 回合在后台继续跑完（没人订阅也照常执行）
+        for _ in range(200):
+            if not agent.status().running:
+                break
+            await asyncio.sleep(0.01)
+        assert agent.status().running is False
         with caplog.at_level(logging.ERROR, logger="liorium.agent"):
             events = await collect(agent, "b")
         assert [e.type for e in events][-1] == "done"

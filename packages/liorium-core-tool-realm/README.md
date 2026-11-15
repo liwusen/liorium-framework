@@ -35,7 +35,7 @@ agent = LioriumAgent(
 )
 ```
 
-CLI 里等价于默认装配 + `--tools read,find`；`--no-core-tools` 则不装这个 realm。
+CLI 里等价于 profile 的 `toolsets.default = ["read", "find"]`；profile 里删掉 core 条目则不装这个 realm。
 
 ## API
 
@@ -49,7 +49,7 @@ CLI 里等价于默认装配 + `--tools read,find`；`--no-core-tools` 则不装
 
 工具子集来源（先到先得）：
 
-1. `RealmSpec.params["tools"]`（字符串或字符串序列；未知名字抛 `ValueError`，realm 标 `failed`）；
+1. `RealmSpec.config["tools"]`（字符串或字符串序列；未知名字抛 `ValueError`，realm 标 `failed`）；
 2. `AgentSpec.toolsets["default"]`；
 3. 都没有 ⇒ 六个全给。
 

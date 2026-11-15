@@ -21,7 +21,7 @@ agent = LioriumAgent(
 ```
 
 默认库在 ``<inbox_dir>/memory/memory.sqlite``（正文在 ``memory/content/``），
-也可以用 ``RealmSpec.params["db_path"]`` / ``["content_dir"]`` 指到别处。
+也可以用 ``RealmSpec.config["db_path"]`` / ``["content_dir"]`` 指到别处。
 """
 
 from __future__ import annotations
@@ -30,6 +30,7 @@ __version__ = "0.1.1"
 
 # 轻量面：只要关键词检索就不需要 numpy / httpx（它们在 [vector] extra 里，
 # 由 ``liorium.memory.vectors`` / ``liorium.memory.embeddings`` 直接 import）。
+from .config import EmbedConfig, MemoryConfig
 from .graph import Entity, EntityGraph, Relation
 from .realm import MOUNT_PREFIX, SCHEME, STORE_DIR_NAME, MemoryRealm
 from .search import MemorySearch, SearchConfig, SearchResult
@@ -53,6 +54,7 @@ __all__ = [
     "STORE_DIR_NAME",
     "Entity",
     "EntityGraph",
+    "EmbedConfig",
     "MemoryEntry",
     "MemoryNode",
     "MemoryRealm",

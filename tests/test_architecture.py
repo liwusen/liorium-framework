@@ -70,6 +70,14 @@ LIORIUM_ALLOWED: dict[str, set[str]] = {
         "liorium.realm_base",
     },
     "liorium-provider-manager": {"liorium.core", "liorium.provider"},
+    # 装配配方层（2026-11-14）：编译成 agent 的 spec + provider 的池；不反向依赖 CLI。
+    "liorium-profile": {
+        "liorium.agent",
+        "liorium.core",
+        "liorium.provider",
+        "liorium.realm_base",
+        "liorium.vfs",
+    },
 }
 
 #: 零第三方依赖的叶子包（计划 §3.8）：import 只能是标准库或白名单里的 liorium 包。
@@ -77,11 +85,15 @@ ZERO_DEPENDENCY_PACKAGES = ("liorium-core", "liorium-vfs")
 
 #: 允许调用 ``asyncio.create_task`` 的白名单（相对仓库根）。
 #: - ``liorium/realm_base/base.py``：realm 的 ``ctx.spawn`` 实现（2026-11-07 从 agent 搬来）；
-#: - ``cli/subagents.py``：CLI 是宿主，事件监控任务由宿主自己托管。
+#: - ``cli/subagents.py``：CLI 是宿主，事件监控任务由宿主自己托管；
+#: - ``agent/runtime/worker.py``（2026-11-12）：事件流原生化的常驻 worker ——
+#:   "worker 拥有回合"（定稿 §1）意味着 Agent 内部必须常驻一个任务，它不属于任何
+#:   realm 的 ``ctx.spawn`` 生命周期。
 ASYNCIO_CREATE_TASK_WHITELIST = frozenset(
     {
         "packages/liorium-realm-base/src/liorium/realm_base/base.py",
         "packages/liorium-cli/src/liorium/cli/subagents.py",
+        "packages/liorium-agent/src/liorium/agent/runtime/worker.py",
     }
 )
 
@@ -205,6 +217,7 @@ def test_packages_are_discovered() -> None:
         "liorium-agent",
         "liorium-core-tool",
         "liorium-todo-realm",
+        "liorium-profile",
     } <= names
     for package in package_dirs():
         assert python_files(package), f"{package.name} 没有扫到任何 .py 文件"

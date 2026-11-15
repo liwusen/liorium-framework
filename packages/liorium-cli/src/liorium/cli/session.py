@@ -3,22 +3,22 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
+import itertools
 import json
 import os
 import traceback
-from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from liorium.agent import AgentSpec, Limits, LioriumAgent, RealmSpec
-from liorium.core.errors import RealmNotFoundError, TurnError, TurnInterrupted
+from liorium.agent import LioriumAgent
+from liorium.core.errors import RealmNotFoundError, TurnError
 from liorium.core.log import get_logger
 from liorium.core.types import ContextItem, Event
+from liorium.profile import AgentProfile, ProfileBuild
 from liorium.provider import (
     catalog_status,
-    close_chat_model,
     describe_thinking,
     ensure_catalog,
     normalize_intensity,
@@ -26,7 +26,7 @@ from liorium.provider import (
 )
 
 from .env import EnvReport
-from .providers import ProviderConfigError, ProviderRegistry, ResolvedModel, make_chat_model
+from .providers import ProviderConfigError, ProviderRegistry, ResolvedModel
 from .subagents import SubagentMonitor, render_list, render_snapshot, resolve_name
 from .ui import Ui, indent, memory_meta, short_json, truncate
 
@@ -48,7 +48,7 @@ DEFAULT_SYSTEM_PROMPT = """\
 
 COMMANDS = [
     ("/help", "显示帮助"),
-    ("/setup [providers|memory]", "交互式配置 provider / 记忆系统（写入 ~/.liorium）"),
+    ("/setup [providers|memory|profile|show]", "交互式配置 provider / 记忆 / profile（写入配置根目录）"),
     ("/model [Provider::model]", "列出或切换模型"),
     ("/provider <name>", "切换 provider（保留同名模型）"),
     ("/thinking [off|low|medium|high]", "查看或切换思考强度"),
@@ -69,16 +69,6 @@ COMMANDS = [
     ("/exit", "退出"),
 ]
 
-# 可选 realm 能力包：realm id -> (模块, 类名, 安装提示)。缺包时降级，不炸整个 CLI。
-# 12 个模块都装在同一个发行版 ``liorium`` 里，所以四个提示现在指向同一个包；
-# 保留逐项映射是因为「导入失败」仍然可能发生（只做了部分安装 / 环境被改坏）。
-CAPABILITIES: dict[str, tuple[str, str, str]] = {
-    "core": ("liorium.core_tool_realm", "CoreToolRealm", "liorium"),
-    "memory": ("liorium.memory", "MemoryRealm", "liorium"),
-    "skills": ("liorium.skills", "SkillsRealm", "liorium"),
-    "todo": ("liorium.todo_realm", "TodoRealm", "liorium"),
-}
-
 MEMORY_DB_NAME = "memory.sqlite"
 MEMORY_CONTENT_DIR_NAME = "content"
 
@@ -92,7 +82,6 @@ REALM_STATE_LABELS = {
 }
 
 REALM_STARTUP_FLAGS = {
-    "core": "--no-core-tools",
     "memory": "--no-memory",
     "skills": "--no-skills",
     "todo": "--no-todo",
@@ -108,34 +97,6 @@ REALM_DISABLE_HINTS = {
 }
 
 
-def load_capability_realms(
-    wanted: Iterable[str] | None = None,
-) -> tuple[dict[str, Any], dict[str, str]]:
-    """按需导入能力包，返回 ``(realm 工厂表, 缺失原因)``。
-
-    12 个模块都在同一个发行版 ``liorium`` 里，正常情况下不会缺；真缺了（只做了部分安装、
-    环境被改坏）也只让对应功能降级并给出原因，CLI 的六个核心工具照常可用。
-    """
-    names = list(CAPABILITIES) if wanted is None else [n for n in wanted if n in CAPABILITIES]
-    factories: dict[str, Any] = {}
-    errors: dict[str, str] = {}
-    for name in names:
-        module_name, class_name, _extra = CAPABILITIES[name]
-        try:
-            module = importlib.import_module(module_name)
-            factories[name] = getattr(module, class_name)
-        except Exception as exc:  # noqa: BLE001 - 缺包/坏包都降级，原因留给 UI 显示
-            errors[name] = f"{type(exc).__name__}: {exc}"
-    return factories, errors
-
-
-def capability_hint(name: str) -> str:
-    entry = CAPABILITIES.get(name)
-    if entry is None:
-        return ""
-    return f"pip install '{entry[2]}'"
-
-
 # ---------------------------------------------------------------------------
 # 会话
 # ---------------------------------------------------------------------------
@@ -145,6 +106,12 @@ def capability_hint(name: str) -> str:
 class CliOptions:
     workspace: Path
     inbox: Path
+    workspace_explicit: bool = True
+    """``--workspace`` 是否显式给过：显式才算"本次覆盖"，否则听 profile 的。"""
+    inbox_explicit: bool = True
+    """``--inbox`` 是否显式给过。"""
+    profile_path: Path | None = None
+    """本次使用的 profile 文件（``--profile`` / 搜索顺序的结果）。"""
     system_prompt: Path | None = None
     temperature: float = 0.3
     max_turns: int = 500
@@ -154,28 +121,10 @@ class CliOptions:
     json_mode: bool = False
     color: bool = True
     show_banner: bool = True
-    enable_core_tools: bool = True
-    """是否装配 ``core`` realm（六个核心工具）。关掉 = Agent 一个工具都没有（除别的 realm）。"""
-    tools: tuple[str, ...] = ()
-    """核心工具子集（``--tools read,write``）；空 = 六个全给（写进 ``toolsets["default"]``）。"""
     enable_memory: bool = True
     enable_skills: bool = True
     enable_todo: bool = True
     enable_subagents: bool = True
-    memory_dir: Path | None = None
-    """记忆库目录（``memory.sqlite`` + ``content/``）；None = ``<inbox>/memory``。"""
-    skills_dir: Path | None = None
-    """技能目录（``<slug>/SKILL.md``）；None = ``<inbox>/skill.d``。"""
-    embed_model: str = ""
-    """embedding 模型名；空 = 不启用语义检索（只跑关键词）。"""
-    embed_base_url: str = ""
-    """embedding 的 OpenAI 兼容 base_url；空 = 跟随当前 provider。"""
-    embed_key: str = ""
-    """embedding 的 API key；空 = 跟随当前 provider 的 key。"""
-    enable_vectors: bool = True
-    """关掉后即使给了 ``--embed-model`` 也不建向量索引（``--no-vectors``）。"""
-    enable_extraction: bool = True
-    """关掉后不自动抽实体（``--no-extraction``）。"""
     models_dev_cache: Path | None = None
     """models.dev 缓存文件（启动期由 app 解析并传入；``/models-dev`` 用同一路径）。"""
     config_file: Path | None = None
@@ -198,6 +147,7 @@ class CliSession:
         input_fn: Callable[[str], str] = input,
         ui: Ui | None = None,
         model_factory: Callable[[str], Any] | None = None,
+        profile: AgentProfile | None = None,
     ) -> None:
         self.registry = registry
         self.resolved = resolved
@@ -209,178 +159,193 @@ class CliSession:
         """子代理事件监控（``--no-subagents`` 或 realm 启动失败时为 None）。"""
         self.busy = False
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._events: Any = None
+        """常驻事件流（``start()`` 里打开；``stream()`` 本身只构造订阅对象）。"""
+        self._events_iter: Any = None
+        """常驻事件流的迭代器（``__aiter__`` 时才真正注册）。"""
+        self._seq = itertools.count(1)
+        """``push`` 的条目号（id 必填，且是事件流的关联键）。"""
         self._factory_override = model_factory
-        self._model_cache: dict[tuple[str, str | None, str], Any] = {}
-        self.capabilities: dict[str, Any] = {}
-        """已装载的能力包 realm 工厂（``memory`` / ``skills`` / ``todo``）。"""
-        self.capability_errors: dict[str, str] = {}
-        """想用但没装成功的能力包及原因。"""
+        self.profile: AgentProfile | None = profile
+        """宿主注入的 profile（测试 / 嵌入用）；``None`` ⇒ 按 ``options.profile_path`` 读文件。"""
+        self.build: ProfileBuild | None = None
+        """当前生效的编译结果（``start()`` 里定稿；换模型 / 换 profile 时整体替换）。"""
+        self._declared_realms: set[str] = set()
+        """profile 里声明过的 realm id（**未**经过本次 flag 过滤，用于区分"没声明"与"被关掉"）。"""
 
     # -- 生命周期 -------------------------------------------------------
 
-    def _ensure_prompt(self) -> Path:
-        inbox = self.options.inbox
-        inbox.mkdir(parents=True, exist_ok=True)
-        if self.options.system_prompt is not None:
-            return Path(self.options.system_prompt).expanduser()
-        path = inbox / "AGENT.md"
-        if not path.exists():
-            path.write_text(DEFAULT_SYSTEM_PROMPT, encoding="utf-8")
-        return path
+    # -- profile / 编译 --------------------------------------------------
 
-    def _realm_specs(self) -> tuple[RealmSpec, ...]:
-        """按"启用 + 已装载"生成 realm 声明。
+    def _load_profile(self) -> AgentProfile:
+        """读 profile 文件（每次调用都重读：``/reload`` 靠它拿新内容）。"""
+        from . import profile as cli_profile
 
-        ``params`` 只在用户显式指定目录时写入：不写就落到 realm 自己的默认位置
-        （``<inbox>/memory``、``<inbox>/skill.d``），指纹也保持"默认装配"的样子。
-        """
-        specs: list[RealmSpec] = []
-        if "core" in self.capabilities:
-            # 工具子集走 AgentSpec.toolsets["default"]（见 _build_spec），这里只声明 realm。
-            specs.append(RealmSpec(id="core"))
-        if "memory" in self.capabilities:
-            params: dict[str, Any] = {}
-            if self.options.memory_dir is not None:
-                base = Path(self.options.memory_dir).expanduser().resolve()
-                params = {
-                    "db_path": str(base / MEMORY_DB_NAME),
-                    "content_dir": str(base / MEMORY_CONTENT_DIR_NAME),
-                }
-            specs.append(RealmSpec(id="memory", params=params))
-        if "skills" in self.capabilities:
-            params = {}
-            if self.options.skills_dir is not None:
-                params = {"skills_dir": str(Path(self.options.skills_dir).expanduser().resolve())}
-            specs.append(RealmSpec(id="skills", params=params))
-        if "todo" in self.capabilities:
-            # 节奏用 TodoRealm 的默认值（每 50 回合），params 只由 realm 自己解释。
-            specs.append(RealmSpec(id="todo"))
-        if self.options.enable_subagents:
-            # 子代理是 Agent 内置 realm（工厂由 LioriumAgent.start 自动注册），
-            # 不属于可选 realm 能力包，所以放在最后且不需要 realm_factories 项。
-            specs.append(RealmSpec(id="subagents"))
-        return tuple(specs)
+        path = self.options.profile_path or cli_profile.resolve_profile_path()
+        return AgentProfile.load(path)
 
-    def _build_spec(self) -> AgentSpec:
-        prompt_path = self._ensure_prompt()
-        try:
-            prompt_rel = str(prompt_path.relative_to(self.options.inbox))
-        except ValueError:
-            prompt_rel = str(prompt_path)
-        return AgentSpec(
-            id="cli",
-            inbox_dir=self.options.inbox,
-            model=self.resolved.label,
-            prompt_sources=(prompt_rel,),
-            realms=self._realm_specs(),
-            # 工具子集交给 core realm 读（Agent 自己不解释 toolsets）
-            toolsets={"default": tuple(self.options.tools)} if self.options.tools else {},
-            limits=Limits(
-                context_window=self.resolved.context_window,
-                max_turns=self.options.max_turns,
-                compact_keep_rounds=3,
-            ),
-            workspace_root=self.options.workspace,
-        )
-
-    def _load_capabilities(self) -> None:
-        wanted = [
-            name
-            for name, enabled in (
-                ("core", self.options.enable_core_tools),
-                ("memory", self.options.enable_memory),
-                ("skills", self.options.enable_skills),
-                ("todo", self.options.enable_todo),
-            )
-            if enabled
-        ]
-        self.capabilities, self.capability_errors = load_capability_realms(wanted)
-        if "memory" in self.capabilities:
-            self.capabilities["memory"] = self._wrap_memory_factory(self.capabilities["memory"])
-
-    # -- 记忆 realm：注入 embedding / 抽取服务 ---------------------------
-
-    def _memory_base(self) -> Path:
-        """记忆库目录（与 ``_realm_specs`` 保持一致）。"""
-        if self.options.memory_dir is not None:
-            return Path(self.options.memory_dir).expanduser().resolve()
-        return self.options.inbox / "memory"
-
-    def _wrap_memory_factory(self, realm_cls: Any) -> Any:
-        """把可选服务（向量 / 抽取）通过闭包注入 realm。
-
-        服务对象**不进** ``RealmSpec.params``：params 要参与指纹，必须是可 JSON 化的。
-        """
-
-        def factory(spec: Any) -> Any:
-            kwargs = self._memory_services()
-            return realm_cls(spec, **kwargs)
-
-        return factory
-
-    def _memory_services(self) -> dict[str, Any]:
-        ui = self.ui
+    def _apply_overrides(self, profile: AgentProfile) -> AgentProfile:
+        """把本次运行的 flag 覆盖到 profile 副本上（绝不写回文件，G5）。"""
         options = self.options
-        services: dict[str, Any] = {}
-        if not (options.enable_vectors and options.embed_model):
-            return services
-        try:
-            from liorium.memory.embeddings import OpenAICompatibleEmbeddings
-            from liorium.memory.vectors import NanoVectorBackend
-        except ImportError as exc:  # 没装 [vector] extra
-            ui.warn(f"语义检索不可用（{exc}）；装它: pip install 'liorium[vector]'")
-            return services
-        base = self._memory_base() / "index"
-        try:
-            services["embedder"] = OpenAICompatibleEmbeddings(
-                model=options.embed_model,
-                api_key=options.embed_key or self.resolved.provider.api_key,
-                base_url=options.embed_base_url or self.resolved.base_url,
+        self._declared_realms = {entry.id for entry in profile.realms}
+        realms = [
+            entry
+            for entry in profile.realms
+            if not (
+                (entry.id == "memory" and not options.enable_memory)
+                or (entry.id == "skills" and not options.enable_skills)
+                or (entry.id == "todo" and not options.enable_todo)
+                or (entry.id == "subagents" and not options.enable_subagents)
             )
-        except Exception as exc:  # noqa: BLE001 - 配置不全就降级成关键词检索
-            ui.warn(f"embedding 初始化失败（{exc}）；本次只跑关键词检索")
-            return services
-        services["vectors"] = NanoVectorBackend(base / "chunks.vdb")
-        services["entity_vectors"] = NanoVectorBackend(base / "entity.vdb")
-        if options.enable_extraction:
-            try:
-                from liorium.memory.extract import LlmExtractor
-
-                services["extractor"] = LlmExtractor(chat=self._extract_chat)
-            except Exception as exc:  # noqa: BLE001
-                ui.warn(f"实体抽取不可用（{exc}）")
-        return services
-
-    async def _extract_chat(self, system: str, user: str) -> str:
-        """抽取用的模型调用（复用当前模型；aux 调用不启用思考）。"""
-        from langchain_core.messages import HumanMessage, SystemMessage
-
-        if self._factory_override is not None:
-            model = self._factory_override(self.resolved.label)
-        else:
-            model = self._build_model(self.resolved.label, purpose="aux")
-        reply = await model.ainvoke(
-            [SystemMessage(content=system), HumanMessage(content=user)]
+        ]
+        prompt = (
+            [str(Path(options.system_prompt).expanduser().resolve())]
+            if options.system_prompt is not None
+            else list(profile.prompt)
         )
-        content = getattr(reply, "content", "")
-        return content if isinstance(content, str) else str(content)
+        self._ensure_prompt_files(prompt, self._prompt_inbox(profile))
+        update: dict[str, Any] = {
+            "thinking": options.thinking,
+            "temperature": options.temperature,
+            "prompt": prompt,
+            "limits": profile.limits.model_copy(update={"max_turns": options.max_turns}),
+            "realms": realms,
+        }
+        # 只有显式 flag 才覆盖路径；否则听 profile 的（``/reload`` 才能发现 inbox 变了）。
+        if options.workspace_explicit:
+            update["workspace"] = str(options.workspace)
+        if options.inbox_explicit:
+            update["inbox"] = str(options.inbox)
+        return profile.model_copy(update=update)
+
+    def _prompt_inbox(self, profile: AgentProfile) -> Path:
+        """本次编译实际用的 inbox（``--inbox`` 显式给过才用 options 的）。"""
+        if self.options.inbox_explicit:
+            return self.options.inbox
+        workspace = self.options.workspace if self.options.workspace_explicit else None
+        if workspace is None:
+            raw_workspace = profile.workspace
+            if raw_workspace:
+                path = Path(raw_workspace).expanduser()
+                workspace = (
+                    path if path.is_absolute() else (profile.base_dir / path).resolve()
+                )
+            else:
+                workspace = Path.cwd()
+        raw_inbox = profile.inbox
+        if raw_inbox:
+            path = Path(raw_inbox).expanduser()
+            return path if path.is_absolute() else (workspace / path)
+        return workspace / ".liorium" / "agent"
+
+    def _ensure_prompt_files(self, prompt: list[str], inbox: Path) -> None:
+        """默认 profile 只写 ``AGENT.md``；文件缺失时补一份内置模板（B5）。"""
+        if self.options.system_prompt is not None:
+            return
+        inbox.mkdir(parents=True, exist_ok=True)
+        for raw in prompt:
+            target = Path(raw)
+            if not target.is_absolute():
+                target = inbox / target
+            if target.name == "AGENT.md" and not target.exists():
+                target.write_text(DEFAULT_SYSTEM_PROMPT, encoding="utf-8")
+
+    def _make_build(
+        self,
+        *,
+        registry: ProviderRegistry | None = None,
+        label: str | None = None,
+        profile: AgentProfile | None = None,
+    ) -> ProfileBuild:
+        base = profile if profile is not None else self._load_profile()
+        prepared = self._apply_overrides(base)
+        return prepared.build(
+            registry=registry if registry is not None else self.registry,
+            model=label or self.resolved.label,
+        )
+
+    def _create_agent(self, build: ProfileBuild) -> LioriumAgent:
+        if self._factory_override is not None:
+            # 测试 / 宿主注入：模型工厂优先；spec 与 realm 工厂仍来自 profile。
+            return LioriumAgent(
+                spec=build.spec,
+                model_factory=self._factory_override,
+                realm_factories=build.realm_factories,
+            )
+        return build.create_agent()
+
+    async def _install_build(self, build: ProfileBuild) -> bool:
+        """把新编译结果热应用：换工厂 → ``apply()`` → 成功后关掉旧池。"""
+        assert self.agent is not None
+        agent = self.agent
+        # 宿主注入了 model_factory（测试 / 嵌入）时不要换成池里的工厂。
+        swap = self._factory_override is None
+        old_chat, old_compact = agent.model_factory, agent.compact_model_factory
+        if swap:
+            agent.model_factory = build.pool.chat
+            agent.compact_model_factory = build.pool.compact
+        try:
+            result = await agent.apply(build.spec, force=True)
+        except Exception as exc:  # noqa: BLE001
+            if swap:
+                agent.model_factory, agent.compact_model_factory = old_chat, old_compact
+            await build.close()
+            self.ui.error(f"应用 profile 失败: {type(exc).__name__}: {exc}")
+            return False
+        if result.failed:
+            if swap:
+                agent.model_factory, agent.compact_model_factory = old_chat, old_compact
+            await build.close()
+            self.ui.error(f"应用 profile 失败: {result.failed}")
+            return False
+        old_build, self.build = self.build, build
+        # 展示用的路径跟着最新 spec 走（banner / /status 不显示过期值）。
+        self.options.workspace = build.spec.workspace_root
+        self.options.inbox = build.spec.inbox_dir
+        if old_build is not None:
+            await old_build.close()
+        return True
+
+    async def _reload_profile(self, *, label: str | None = None) -> bool:
+        """重新读 profile 文件并热应用（``/reload`` / ``/setup memory`` 用）。"""
+        try:
+            build = self._make_build(label=label)
+        except Exception as exc:  # noqa: BLE001 - ProfileError / ProviderConfigError
+            self.ui.error(f"profile 加载失败: {exc}")
+            return False
+        if self.agent is None:
+            self.build = build
+            return True
+        current = self.agent.spec
+        if build.spec.id != current.id:
+            await build.close()
+            self.ui.error("profile 的 id 变了：请重启 CLI")
+            return False
+        if build.spec.inbox_dir != current.inbox_dir:
+            await build.close()
+            self.ui.error("profile 的 inbox 变了：请重启 CLI")
+            return False
+        return await self._install_build(build)
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
-        self._load_capabilities()
-        if self.capability_errors and not self.options.json_mode:
-            for name, reason in self.capability_errors.items():
-                self.ui.warn(
-                    f"{name} 能力不可用（{reason}）；装它: {capability_hint(name)}"
-                )
-        spec = self._build_spec()
-        self.agent = LioriumAgent(
-            spec=spec,
-            model_factory=self._factory_override or self._factory,
-            compact_model_factory=self._factory_override or self._compact_factory,
-            realm_factories=self.capabilities,
-        )
-        await self.agent.start()
+        self.build = self._make_build()
+        # 展示用路径以编译结果为准（profile 的 workspace / inbox 可能与启动时解析值不同）。
+        self.options.workspace = self.build.spec.workspace_root
+        self.options.inbox = self.build.spec.inbox_dir
+        self.agent = self._create_agent(self.build)
+        try:
+            await self.agent.start()
+        except BaseException:
+            # 启动失败不能把模型池留在后台（测试里会看到未关闭的 HTTP 客户端）。
+            await self.build.close()
+            raise
+        # 常驻事件流：订阅发生在 __aiter__，必须在任何 push 之前注册。
+        # 用"常驻迭代器 + run_turn 内迭代"而不是后台任务：架构守卫只白名单
+        # cli/subagents.py 与 runtime/worker.py 的 create_task。
+        if self._events is None:
+            self._events = self.agent.stream()
+            self._events_iter = self._events.__aiter__()
         self._warn_failed_realms()
         await self._attach_subagents()
         if self.options.show_banner and not self.options.json_mode:
@@ -416,40 +381,16 @@ class CliSession:
         if self.subagents is not None:
             await self.subagents.close()
             self.subagents = None
+        if self._events is not None:
+            await self._events.aclose()
+            self._events = None
+            self._events_iter = None
         if self.agent is not None:
-            await self.agent.close()
+            await self.agent.close()  # 内部已关模型池（E3）
             self.agent = None
-        for model in self._model_cache.values():
-            try:
-                await close_chat_model(model)
-            except Exception as exc:  # noqa: BLE001 - 关闭失败不能拖垮退出
-                log.warning("关闭模型客户端失败: %s", exc)
-        self._model_cache.clear()
-
-    def _factory(self, label: str) -> Any:
-        """主对话模型工厂（思考强度跟随 ``options.thinking``）。"""
-        return self._build_model(label, purpose="chat")
-
-    def _compact_factory(self, label: str) -> Any:
-        """压缩摘要模型工厂（强制不思考，避免摘要调用放大成本）。"""
-        return self._build_model(label, purpose="compact")
-
-    def _build_model(self, label: str, *, purpose: str) -> Any:
-        intensity = (
-            normalize_intensity(self.options.thinking) if purpose == "chat" else None
-        )
-        cache_key = (label, intensity, purpose)
-        if cache_key in self._model_cache:
-            return self._model_cache[cache_key]
-        resolved = self.registry.resolve(label)
-        model = make_chat_model(
-            resolved,
-            intensity=intensity,
-            temperature=self.options.temperature,
-            purpose=purpose,
-        )
-        self._model_cache[cache_key] = model
-        return model
+        if self.build is not None:
+            await self.build.close()  # 幂等兜底
+            self.build = None
 
     # -- 展示 -----------------------------------------------------------
 
@@ -513,11 +454,14 @@ class CliSession:
         return f"{root}  (空，放 <slug>/SKILL.md 进去；示例见 examples/skills/)"
 
     def _render_event(self, event: Event) -> None:
+        etype = event.type
+        if etype == "input":
+            # 入站生命周期帧只用于流关联，CLI 不展示（也不进 --json 输出）。
+            return
         if self.options.json_mode:
             self.ui.writeln(json.dumps(event.to_dict(), ensure_ascii=False))
             return
         ui = self.ui
-        etype = event.type
         if etype == "start":
             ui.ensure_newline()
         elif etype == "delta":
@@ -544,6 +488,15 @@ class CliSession:
                 ui.writeln(ui.red(f"  压缩失败: {event.get('error') or ''}"))
             elif ok:
                 ui.writeln(ui.dim("  压缩完成"))
+        elif etype == "round_aborted":
+            ui.ensure_newline()
+            ui.writeln(ui.dim("  （本轮被打断，重说）"))
+        elif etype == "interrupted":
+            ui.ensure_newline()
+            ui.info("[已中断]")
+        elif etype == "error":
+            ui.ensure_newline()
+            ui.error(f"回合失败: {event.get('error') or '未知错误'}")
         elif etype == "done":
             ui.ensure_newline()
 
@@ -551,15 +504,23 @@ class CliSession:
 
     async def run_turn(self, text: str) -> bool:
         assert self.agent is not None
+        assert self._events_iter is not None, "session.start() 未调用"
         self.busy = True
         ok = True
         try:
-            async for event in self.agent.run(text):
+            entry_id = f"cli:{next(self._seq)}"
+            self.agent.push(text, id=entry_id)
+            while True:
+                try:
+                    event = await self._events_iter.__anext__()
+                except StopAsyncIteration:
+                    # agent 已 close（hub 关闭）：优雅结束，别让 REPL 崩掉。
+                    return False
                 self._render_event(event)
-        except TurnInterrupted:
-            self.ui.ensure_newline()
-            self.ui.info("[已中断]")
-            ok = False
+                if event.type in ("interrupted", "error"):
+                    ok = False
+                if event.type in ("done", "interrupted", "error"):
+                    break
         except TurnError as exc:
             self.ui.ensure_newline()
             self.ui.error(f"回合失败: {exc}")
@@ -655,7 +616,7 @@ class CliSession:
             if not argument:
                 self.ui.warn("用法: /inject <text>")
             else:
-                await self.agent.inject([ContextItem(source="cli:inject", text=argument)])
+                self.agent.inject([ContextItem(source="cli:inject", text=argument)])
                 self.ui.info("已排队注入；下一个安全点物化成独立 user 消息")
         elif command == "/context":
             self._print_context()
@@ -1125,6 +1086,9 @@ class CliSession:
     def _warn_unknown_realm(self, realm_id: str) -> None:
         known = ", ".join(self.agent.realms.order) if self.agent is not None else ""
         self.ui.warn(f"没有装配 realm: {realm_id}（已装配: {known or '（无）'}）")
+        if realm_id not in self._declared_realms:
+            self.ui.info(f"profile 的 realms 里没有 {realm_id}；加进去后重启 CLI 才会装配")
+            return
         flag = REALM_STARTUP_FLAGS.get(realm_id)
         if flag:
             self.ui.info(
@@ -1191,21 +1155,24 @@ class CliSession:
                 await self._attach_subagents()
 
     async def _command_reload(self) -> None:
-        """重扫技能目录 / 记忆库并热替换工具、挂载、system prompt。"""
+        """重读 profile + 重扫技能目录 / 记忆库，然后热替换运行时。"""
         if self.agent is None:
             return
         before = self.agent.epoch.value
         try:
-            changed = await self.agent.refresh_realms()
+            await self.agent.refresh_realms()
         except Exception as exc:  # noqa: BLE001 - 刷新失败不该炸掉 REPL
             self.ui.error(f"刷新失败: {type(exc).__name__}: {exc}")
             return
-        after = self.agent.epoch.value
-        if not changed:
-            self.ui.info("没有运行中的 realm 需要刷新（--no-memory --no-skills？）")
+        if not await self._reload_profile():
             return
-        note = f"epoch {before} → {after}" if after != before else f"epoch {after} 未变（工具与提示词没变）"
-        self.ui.info(f"已刷新 realm：工具 {len(self.agent.tools)} 个，{note}")
+        after = self.agent.epoch.value
+        note = (
+            f"epoch {before} → {after}"
+            if after != before
+            else f"epoch {after} 未变（工具与提示词没变）"
+        )
+        self.ui.info(f"已重读 profile：工具 {len(self.agent.tools)} 个，{note}")
 
     async def _command_model(self, argument: str) -> None:
         if not argument:
@@ -1269,16 +1236,10 @@ class CliSession:
             self.ui.error(str(exc))
             return
         self.options.thinking = "off" if level is None else level
-        self._model_cache.clear()
-        result = await self.agent.apply(self.agent.spec, force=True)
-        if result.failed:
+        if not await self._reload_profile():
             self.options.thinking = previous
-            self._model_cache.clear()
-            self.ui.error(f"切换思考失败: {result.failed}")
             return
-        self.ui.info(
-            f"思考已切换为 {self.options.thinking}（epoch {result.epoch.value}）"
-        )
+        self.ui.info(f"思考已切换为 {self.options.thinking}")
 
     async def _command_models_dev(self, argument: str) -> None:
         assert self.agent is not None
@@ -1323,21 +1284,14 @@ class CliSession:
         except ProviderConfigError as exc:
             self.ui.error(f"目录已刷新，但当前模型无法重新解析: {exc}")
             return
-        new_limits = replace(
-            self.agent.spec.limits, context_window=new_resolved.context_window
-        )
-        new_spec = replace(
-            self.agent.spec, model=new_resolved.label, limits=new_limits
-        )
-        result = await self.agent.apply(new_spec, force=True)
-        if result.failed:
-            self.ui.error(f"目录已刷新，但重建运行时失败: {result.failed}")
-            return
         self.resolved = new_resolved
+        # 目录可能改了 api_format / 上下文窗口：按 profile 重新编译，别直接改 spec。
+        if not await self._reload_profile():
+            return
         routed = sum(int(item.get("routed") or 0) for item in results)
         self.ui.info(
             f"models.dev 已刷新: {len(catalog)} providers，路由 {routed} 个模型"
-            f"（epoch {result.epoch.value}）"
+            f"（epoch {self.agent.epoch.value}）"
         )
 
     async def _command_provider(self, argument: str) -> None:
@@ -1355,10 +1309,10 @@ class CliSession:
     # -- 配置（与 liorium-cli setup 共用同一套实现） ---------------------
 
     async def _command_setup(self, argument: str) -> None:
-        """``/setup [providers|memory|show|doctor|init]``。
+        """``/setup [providers|memory|profile|show|doctor|init]``。
 
-        写入 ``~/.liorium/providers.json`` / ``config.json``（与 ``liorium-cli setup``
-        完全一致），并在当前会话里尽量热应用：provider 切换模型、记忆开关重建 realm。
+        写入 ``providers.json`` / ``profile.json``（与 ``liorium-cli setup`` 完全一致），
+        并在当前会话里尽量热应用：provider 切换模型、记忆开关重建 realm。
         """
         from . import setup as cli_setup
         from .config import ConfigError, config_path, providers_path
@@ -1366,6 +1320,7 @@ class CliSession:
         ctx = cli_setup.Ctx(
             providers=Path(self.options.providers_file or providers_path()),
             config_file=Path(self.options.config_file or config_path()),
+            profile=self.options.profile_path,
             input_fn=self.input_fn,
             print_fn=self.ui.writeln,
             inbox=self.options.inbox,
@@ -1392,7 +1347,9 @@ class CliSession:
         if result.providers_changed:
             await self._reload_registry(result.provider_label)
         if result.memory_changed:
-            await self._apply_memory_result(result)
+            # 向导改的是 profile 里的 memory realm config；重读 + 重建 realm 即可。
+            if await self._reload_profile():
+                self.ui.info("记忆设置已生效")
 
     async def _reload_registry(self, label: str | None) -> None:
         """重新读 providers.json，并切到指定（或默认）模型。"""
@@ -1404,14 +1361,6 @@ class CliSession:
         except ProviderConfigError as exc:
             self.ui.warn(f"provider 配置已写入，但读不出来: {exc}")
             return
-        # 同一个标签的 base_url / key 可能刚被改过：旧模型客户端必须丢弃。
-        for model in self._model_cache.values():
-            try:
-                await close_chat_model(model)
-            except Exception as exc:  # noqa: BLE001 - 关闭失败不阻断配置生效
-                log.warning("关闭旧模型客户端失败: %s", exc)
-        self._model_cache.clear()
-        self.registry = registry
         target = (label or "").strip()
         if not target:
             try:
@@ -1424,74 +1373,32 @@ class CliSession:
         except ProviderConfigError as exc:
             self.ui.warn(f"provider 已更新；{target} 暂时不可用: {exc}")
             return
+        self.registry = registry
+        await self._switch_to(resolved, registry=registry)
+
+    async def _switch_to(
+        self, resolved: ResolvedModel, *, registry: ProviderRegistry | None = None
+    ) -> None:
+        """换模型 = 用 profile 重新编译一份 build，再热应用。"""
         if self.agent is None:
+            if registry is not None:
+                self.registry = registry
             self.resolved = resolved
-            self.ui.info(f"已切换到 {resolved.label}")
             return
-        await self._switch_to(resolved)
-
-    async def _apply_memory_result(self, result: Any) -> None:
-        """把 memory.* 设置读回 options，并尽量热重建记忆 realm。"""
-        from . import config as cli_config
-        from .config import ConfigError
-
         try:
-            config = cli_config.load_config(self.options.config_file)
-        except ConfigError as exc:
-            self.ui.error(f"读取记忆设置失败: {exc}")
+            build = self._make_build(
+                registry=registry if registry is not None else self.registry,
+                label=resolved.label,
+            )
+        except Exception as exc:  # noqa: BLE001 - ProfileError 等
+            self.ui.error(f"切换失败: {exc}")
             return
-        options = self.options
-        options.embed_model = str(
-            cli_config.get_value(config, "memory.embed_model", "") or ""
-        )
-        options.embed_base_url = str(
-            cli_config.get_value(config, "memory.embed_base_url", "") or ""
-        )
-        options.embed_key = str(cli_config.get_value(config, "memory.embed_key", "") or "")
-        options.enable_vectors = bool(cli_config.get_value(config, "memory.vectors", True))
-        options.enable_extraction = bool(
-            cli_config.get_value(config, "memory.extraction", True)
-        )
-        if result.memory_dir_changed:
-            raw = cli_config.get_value(config, "memory.dir")
-            options.memory_dir = Path(str(raw)).expanduser() if raw else None
-
-        if result.memory_enabled is not None:
-            options.enable_memory = result.memory_enabled
-            if self.agent is not None and "memory" in self.capabilities:
-                await self._toggle_realm("memory", result.memory_enabled)
-            else:
-                self.ui.info("记忆开关已保存：重启 CLI 后生效（启动时被 --no-memory 关掉了）")
+        if not await self._install_build(build):
             return
-
-        if result.memory_dir_changed:
-            self.ui.info("记忆目录已保存：重启 CLI 后生效（realm 路径在启动时装配）")
-            return
-        if result.memory_embed_changed and self.agent is not None:
-            if self._realm_instance("memory") is not None:
-                await self._toggle_realm("memory", False)
-                await self._toggle_realm("memory", True)
-                self.ui.info("记忆 realm 已按新的 embedding 设置重建")
-            else:
-                self.ui.info("embedding 设置已保存：/realm enable memory 或重启后生效")
-
-
-    async def _switch_to(self, resolved: ResolvedModel) -> None:
-        assert self.agent is not None
-        new_limits = replace(
-            self.agent.spec.limits, context_window=resolved.context_window
-        )
-        new_spec = replace(
-            self.agent.spec, model=resolved.label, limits=new_limits
-        )
-        result = await self.agent.apply(new_spec)
-        if result.failed:
-            self.ui.error(f"切换失败: {result.failed}")
-            return
+        if registry is not None:
+            self.registry = registry
         self.resolved = resolved
-        self.ui.info(
-            f"已切换到 {resolved.describe()}（changed={result.changed} epoch={result.epoch.value}）"
-        )
+        self.ui.info(f"已切换到 {resolved.describe()}")
 
     def _print_context(self) -> None:
         history = self.agent.context_channel.history()
@@ -1540,11 +1447,8 @@ def _json_result(text: Any) -> dict[str, Any]:
 
 
 __all__ = [
-    "CAPABILITIES",
     "COMMANDS",
     "DEFAULT_SYSTEM_PROMPT",
     "CliOptions",
     "CliSession",
-    "capability_hint",
-    "load_capability_realms",
 ]

@@ -12,8 +12,9 @@ store，VFS 只出投影节点）、§3.7（memory store 冻结，读写旧库�
 - **工具**：``memory_search``（混合检索）、``memory_list``（分页列目录）、
   ``memory_delete``（目录需 ``recursive``）、``memory_tag``、``memory_score``；
   读/写/编辑用核心 ``read``/``write``/``edit``；
-- **检索**：关键词（FTS5 BM25）默认开；向量检索要宿主注入 ``embedder`` + ``vectors``
-  （本包不读产品配置，也就不自己造 API key）。两者都有时按 RRF 融合；
+- **检索**：关键词（FTS5 BM25）默认开；语义检索由 ``Config.embed`` 驱动：realm 自己建
+  embedder + 向量库（``[vector]`` extra 缺失 / 凭据不全 ⇒ 降级为关键词检索并告警）。
+  本包仍然**不读产品配置文件**：凭据从 ``RealmSpec.config`` 来；
 - **状态**：``state_scope="agent"``，记库路径、条目数、索引体检结果；
 - **dirty**：外部（另一个进程 / 宿主）改了库 ⇒ ``dirty()``，Agent 在回合边界
   调 ``refresh()``；投影是懒加载的，所以"刷新"只是重读 revision（不重建树）。
@@ -36,6 +37,7 @@ from liorium.core.log import get_logger
 from liorium.core.types import Binary, Image, Text, VfsContent
 from liorium.vfs import VirtualFileSystem, VfsMount, VfsNode
 
+from .config import MemoryConfig
 from .graph import EntityGraph
 from .search import MemorySearch, SearchConfig
 from .store import (
@@ -68,6 +70,9 @@ DEFAULT_LIST_LIMIT = 200
 SYNC_REINDEX_CHUNKS = 20_000
 """启动时关键词索引漂移：chunk 数不超过这个值就同步重建，否则丢后台。"""
 
+_MISSING = object()
+"""``getattr`` 哨兵：区分"没有 model 属性"与"model 是 None"。"""
+
 
 class MemoryRealm:
     """记忆 realm：SQLite 懒加载投影 + 混合检索/维护工具 + prompt 用法说明。"""
@@ -77,6 +82,8 @@ class MemoryRealm:
     state_scope = "agent"
     instance_scope = "tree"
     """整棵 Agent 树一份：sqlite 库与 ``/memories`` 挂载都是全树唯一的资源。"""
+    Config = MemoryConfig
+    """配置模型（profile 用它校验 + 填默认；直接构造时同样会校验）。"""
 
     def __init__(
         self,
@@ -89,23 +96,25 @@ class MemoryRealm:
         extractor: "EntityExtractor | None" = None,
         search_config: SearchConfig | None = None,
     ) -> None:
-        params = dict(getattr(spec, "params", {}) or {})
-        self._db_path_param = params.get("db_path")
-        self._content_dir_param = params.get("content_dir")
-        self.list_limit = int(params.get("list_limit", DEFAULT_LIST_LIMIT))
-        if self.list_limit < 1:
-            raise ValueError("list_limit 必须 >= 1")
-        self.keyword_index = bool(params.get("keyword_index", True))
-        self.vectors_enabled = bool(params.get("vectors", True)) and bool(
-            embedder is not None and vectors is not None
+        raw = getattr(spec, "config", None)
+        if raw is None:  # 兼容只实现旧名 ``params`` 的自定义 spec
+            raw = getattr(spec, "params", {})
+        self.config = MemoryConfig.model_validate(dict(raw or {}))
+        self.list_limit = self.config.list_limit
+        self.keyword_index = self.config.keyword_index
+        self.vectors_enabled = bool(
+            self.config.vectors and embedder is not None and vectors is not None
         )
-        self.extraction_enabled = bool(params.get("extraction", True)) and extractor is not None
+        self.extraction_enabled = bool(self.config.extraction and extractor is not None)
 
         self._store = store
         self._owns_store = store is None
         self._embedder = embedder
         self._vectors = vectors
         self._entity_vectors = entity_vectors
+        self._owns_embedder = False
+        self._owns_vectors = False
+        self._owns_entity_vectors = False
         self._extractor_spec = extractor
         self._extractor: "MemoryExtractor | None" = None
         self._graph: EntityGraph | None = None
@@ -126,15 +135,16 @@ class MemoryRealm:
     async def start(self, ctx: Any) -> None:
         self._ctx = ctx
         if self._store is None:
-            db_path = self._resolve_path(ctx, self._db_path_param, "memory.sqlite")
-            content_dir = self._resolve_path(ctx, self._content_dir_param, "content")
+            db_path, content_dir = self._store_paths(ctx)
             self._store = SqliteMemoryStore(
                 db_path, content_dir=content_dir, keyword_index=self.keyword_index
             )
         store = self._store
+        self._ensure_semantic(ctx)
         store.vector_index = self.vectors_enabled
         self._graph = EntityGraph(store, entity_vectors=self._entity_vectors)
         self._search = self._build_search()
+        self._ensure_extractor(ctx)
         if self.extraction_enabled and self._extractor_spec is not None:
             from .extract import MemoryExtractor
 
@@ -185,6 +195,21 @@ class MemoryRealm:
                 await self._vectors.flush()
             except Exception as exc:  # noqa: BLE001 - 退出路径：落盘失败要说出来但别吞掉别的清理
                 log.error("记忆向量落盘失败: %s", exc, exc_info=exc)
+        # 自己造的服务自己关（注入的归宿主）：向量库有落盘/句柄，embedder 有 httpx 客户端。
+        for attr, owned in (
+            ("_vectors", self._owns_vectors),
+            ("_entity_vectors", self._owns_entity_vectors),
+            ("_embedder", self._owns_embedder),
+        ):
+            service = getattr(self, attr)
+            if not owned or service is None:
+                continue
+            try:
+                await service.aclose()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("关闭记忆服务失败（%s）: %s", attr, exc)
+            setattr(self, attr, None)
+        self._owns_vectors = self._owns_entity_vectors = self._owns_embedder = False
         if self._owns_store and self._store is not None:
             self._store.close()
             self._store = None
@@ -264,6 +289,106 @@ class MemoryRealm:
         if not path.is_absolute():
             path = base / path
         return path
+
+    def _memory_dir(self, ctx: Any) -> Path:
+        """``config.dir`` 的目录语义：相对 ``ctx.inbox_dir``，默认 ``<inbox>/memory``。"""
+        inbox = getattr(ctx, "inbox_dir", None)
+        base = Path(inbox) if inbox is not None else Path.cwd()
+        raw = self.config.dir
+        if raw is None:
+            return base / STORE_DIR_NAME
+        path = Path(str(raw)).expanduser()
+        return path if path.is_absolute() else base / path
+
+    def _store_paths(self, ctx: Any) -> tuple[Path, Path]:
+        directory = self._memory_dir(ctx)
+        db_path = (
+            self._resolve_path(ctx, self.config.db_path, "memory.sqlite")
+            if self.config.db_path is not None
+            else directory / "memory.sqlite"
+        )
+        content_dir = (
+            self._resolve_path(ctx, self.config.content_dir, "content")
+            if self.config.content_dir is not None
+            else directory / "content"
+        )
+        return db_path, content_dir
+
+    def _ensure_semantic(self, ctx: Any) -> None:
+        """按 ``config.embed`` 自组装 embedder + 向量库；缺 extras / 缺凭据只降级。"""
+        if not self.config.vectors:
+            self.vectors_enabled = False
+            return
+        if self._embedder is None and self.config.embed is not None:
+            try:
+                from .embeddings import OpenAICompatibleEmbeddings
+                from .vectors import NanoVectorBackend
+            except ImportError as exc:  # 没装 [vector] extra
+                log.warning("语义检索不可用（%s）；装它: pip install 'liorium[vector]'", exc)
+                self.vectors_enabled = False
+                return
+            index_dir = self._memory_dir(ctx) / "index"
+            try:
+                self._embedder = OpenAICompatibleEmbeddings(
+                    model=self.config.embed.model,
+                    api_key=self.config.embed.api_key,
+                    base_url=self.config.embed.base_url,
+                )
+            except Exception as exc:  # noqa: BLE001 - 凭据不全就降级成关键词检索
+                log.warning("embedding 初始化失败（%s）；本次只跑关键词检索", exc)
+                self.vectors_enabled = False
+                return
+            self._owns_embedder = True
+            if self._vectors is None:
+                self._vectors = NanoVectorBackend(index_dir / "chunks.vdb")
+                self._owns_vectors = True
+            if self._entity_vectors is None:
+                self._entity_vectors = NanoVectorBackend(index_dir / "entity.vdb")
+                self._owns_entity_vectors = True
+        self.vectors_enabled = bool(self._embedder is not None and self._vectors is not None)
+
+    def _ensure_extractor(self, ctx: Any) -> None:
+        """没有注入 extractor 时用 ``ctx.model``（aux）自组装；独立使用则关闭抽取。"""
+        if not self.config.extraction or self._extractor_spec is not None:
+            return
+        if getattr(ctx, "model_factory", None) is None:
+            return  # 独立使用：没有 aux 模型端口
+        try:
+            model = self._aux_model(ctx)
+        except Exception as exc:  # noqa: BLE001 - 模型建不出来不该拖垮记忆库
+            log.warning("aux 模型不可用（%s）；关闭实体抽取", exc)
+            return
+        if model is None:
+            return
+        from .extract import LlmExtractor
+
+        self._extractor_spec = LlmExtractor(chat=self._chat_from(ctx))
+        self.extraction_enabled = True
+
+    def _aux_model(self, ctx: Any) -> Any:
+        """取 aux 模型：优先 ``ctx.model``（RealmContext 的 property），否则调工厂。"""
+        factory = getattr(ctx, "model_factory", None)
+        if factory is None:
+            return None
+        model = getattr(ctx, "model", _MISSING)
+        return factory() if model is _MISSING else model
+
+    def _chat_from(self, ctx: Any) -> Any:
+        """把 ``ctx.model`` 包成 ``LlmExtractor`` 要的 ``async (system, user) -> str``。"""
+
+        async def chat(system: str, user: str) -> str:
+            from langchain_core.messages import HumanMessage, SystemMessage
+
+            model = self._aux_model(ctx)
+            if model is None:
+                raise RuntimeError("没有 aux 模型，不能调用记忆抽取")
+            reply = await model.ainvoke(
+                [SystemMessage(content=system), HumanMessage(content=user)]
+            )
+            content = getattr(reply, "content", "")
+            return content if isinstance(content, str) else str(content)
+
+        return chat
 
     # ------------------------------------------------------------------
     # realm 协议

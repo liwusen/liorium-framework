@@ -3,7 +3,7 @@
 三类契约：
 
 1. ``VfsContent`` 是**封闭三元联合**：``Text`` / ``Image`` / ``Binary``，构造即校验；
-2. ``Event`` 只接受 9 种 Agent 事件类型，``to_dict()`` 是前端消费的扁平形态；
+2. ``Event`` 只接受 14 种 Agent 事件类型，``to_dict()`` 是前端消费的扁平形态；
 3. ``render_context_block`` 的文本格式**逐字冻结**（改格式 = 全历史前缀失效）。
 """
 
@@ -32,7 +32,12 @@ from liorium.core.types import (
     ev_compact_start,
     ev_delta,
     ev_done,
+    ev_error,
+    ev_input,
+    ev_interrupted,
+    ev_realm,
     ev_reasoning_delta,
+    ev_round_aborted,
     ev_start,
     ev_tool_result,
     ev_tool_start,
@@ -110,18 +115,20 @@ def test_content_size() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Event：9 种类型 / 扁平 to_dict
+# Event：13 种类型 / 扁平 to_dict
 # ---------------------------------------------------------------------------
 
 
 def test_event_type_table_is_frozen() -> None:
-    """9 种 Agent 事件；增删即破坏前端兼容（计划 §3.5）。
+    """14 种 Agent 事件；增删即破坏前端兼容。
 
-    2026-11-08 删掉宿主事件（``pending`` / ``streaming`` / ``interrupted`` /
-    ``error``）：``run()`` 是唯一事件出口，等待不产出事件、中断与失败用异常。
+    2026-11-08 删掉宿主事件（``pending`` / ``streaming``）；事件流原生化后
+    重新引入 ``interrupted`` / ``error`` 作为**回合终态帧**，并新增
+    ``round_aborted``（非终态）与 ``input``（入站生命周期）。
+    2026-11-14 追加 ``realm``（realm 主动推送，非终态、不开回合），**只在尾部追加**。
     """
-    assert len(AGENT_EVENT_TYPES) == 9
-    assert len(ALL_EVENT_TYPES) == 9
+    assert len(AGENT_EVENT_TYPES) == 14
+    assert len(ALL_EVENT_TYPES) == 14
     assert set(AGENT_EVENT_TYPES) == {
         "start",
         "delta",
@@ -132,6 +139,11 @@ def test_event_type_table_is_frozen() -> None:
         "compact_delta",
         "compact_done",
         "done",
+        "round_aborted",
+        "interrupted",
+        "error",
+        "input",
+        "realm",
     }
 
 
@@ -180,9 +192,42 @@ def test_event_get_and_getitem() -> None:
         event["missing"]
 
 
+def test_ev_realm_shape() -> None:
+    """realm 帧的字段是前端契约：``realm`` / ``name`` / ``data``，回合内才带 ``turn_id``。"""
+    assert ev_realm("todo", "todo.changed", {"pending": 2}).to_dict() == {
+        "type": "realm",
+        "realm": "todo",
+        "name": "todo.changed",
+        "data": {"pending": 2},
+    }
+    assert ev_realm("todo", "x", turn_id="a#1").to_dict() == {
+        "type": "realm",
+        "realm": "todo",
+        "name": "x",
+        "data": {},
+        "turn_id": "a#1",
+    }
+    # 独立 dict：调用方改了原对象不影响事件
+    data = {"k": 1}
+    event = ev_realm("r", "n", data)
+    data["k"] = 2
+    assert event["data"] == {"k": 1}
+
+
 def test_event_helpers_payloads() -> None:
     """事件构造器的字段名是前端契约，逐字断言。"""
-    assert ev_start("t1").to_dict() == {"type": "start", "turn_id": "t1"}
+    assert ev_start("t1").to_dict() == {
+        "type": "start",
+        "turn_id": "t1",
+        "origin": "user",
+        "inputs": [],
+    }
+    assert ev_start("t2", origin="subagent", inputs=["in-1"]).to_dict() == {
+        "type": "start",
+        "turn_id": "t2",
+        "origin": "subagent",
+        "inputs": ["in-1"],
+    }
     assert ev_delta("hi").to_dict() == {"type": "delta", "content": "hi"}
     assert ev_reasoning_delta("想").to_dict() == {"type": "reasoning_delta", "content": "想"}
     assert ev_tool_start("read", {"path": "a"}, "c1").to_dict() == {
@@ -202,6 +247,37 @@ def test_event_helpers_payloads() -> None:
     assert ev_compact_done(True).to_dict() == {"type": "compact_done", "ok": True}
     assert ev_compact_done(False).to_dict() == {"type": "compact_done", "ok": False}
     assert ev_done("t1").to_dict() == {"type": "done", "turn_id": "t1"}
+    assert ev_round_aborted("t1").to_dict() == {
+        "type": "round_aborted",
+        "turn_id": "t1",
+        "reason": "preempted",
+    }
+    assert ev_round_aborted("t1", reason="compacted").to_dict() == {
+        "type": "round_aborted",
+        "turn_id": "t1",
+        "reason": "compacted",
+    }
+    assert ev_interrupted("t1", "close").to_dict() == {
+        "type": "interrupted",
+        "turn_id": "t1",
+        "reason": "close",
+    }
+    assert ev_error("t1", "RuntimeError: 失败").to_dict() == {
+        "type": "error",
+        "turn_id": "t1",
+        "error": "RuntimeError: 失败",
+    }
+    assert ev_input("in-1", "accepted").to_dict() == {
+        "type": "input",
+        "id": "in-1",
+        "state": "accepted",
+    }
+    assert ev_input("in-1", "delivered", turn_id="t1").to_dict() == {
+        "type": "input",
+        "id": "in-1",
+        "state": "delivered",
+        "turn_id": "t1",
+    }
 
 
 # ---------------------------------------------------------------------------

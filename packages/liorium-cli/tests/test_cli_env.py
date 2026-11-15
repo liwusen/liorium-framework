@@ -148,12 +148,12 @@ def test_env_bool(tmp_path: Path, monkeypatch) -> None:
 def test_cli_defaults_read_env(monkeypatch) -> None:
     """命令行优先于环境变量（argparse 的 default 只在没给参数时生效）。"""
     monkeypatch.setenv("LIORIUM_MODEL", "Go::from-env")
-    monkeypatch.setenv("LIORIUM_MEMORY_DIR", "D:/mem")
     monkeypatch.setenv("LIORIUM_NO_COLOR", "1")
     args = build_parser().parse_args([])
     assert args.model == "Go::from-env"
-    assert Path(args.memory_dir) == Path("D:/mem")
     assert args.no_color is True
+    # 结构设置（memory_dir 等）已经不在 flag 里：只在 profile 的 realm config 中
+    assert not hasattr(args, "memory_dir")
 
     args = build_parser().parse_args(["--model", "x::from-cli"])
     assert args.model == "x::from-cli"

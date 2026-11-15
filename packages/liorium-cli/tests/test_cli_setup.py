@@ -482,7 +482,9 @@ def test_build_parser_reads_config_and_profile_defaults(home: Path, tmp_path: Pa
     assert args.no_color is True
 
     data = cli_profile.default_profile()
-    data.update({"thinking": "low", "model": "p::m", "workspace": "D:/ws", "temperature": 0.5})
+    data.update(
+        {"thinking": "low", "model": "p::m", "workspace": str(tmp_path), "temperature": 0.5}
+    )
     data["limits"] = {"max_turns": 7}
     profile = AgentProfile.from_dict(data, base_dir=tmp_path)
 
@@ -496,8 +498,9 @@ def test_build_parser_reads_config_and_profile_defaults(home: Path, tmp_path: Pa
     assert args.workspace is None
     from liorium.cli.app import _resolve_inbox, _resolve_workspace
 
-    assert _resolve_workspace(args, profile) == Path("D:/ws")
-    assert _resolve_inbox(args, profile, Path("D:/ws")) == Path("D:/ws/.liorium-cli/agent")
+    # 用平台无关的绝对路径：Windows 的 "D:/ws" 在 POSIX 上是相对路径，会拼到 base_dir 下。
+    assert _resolve_workspace(args, profile) == tmp_path
+    assert _resolve_inbox(args, profile, tmp_path) == tmp_path / ".liorium-cli" / "agent"
 
     # 命令行仍然最高；结构性 flag 已经不存在（只在 profile 里）
     assert build_parser(config=config, profile=profile).parse_args(["--thinking", "high"]).thinking == "high"

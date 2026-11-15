@@ -1,13 +1,13 @@
 """校验「tag ↔ 发行版版本」一致，供 publish / ci workflow 使用。
 
-发布单元只有一个：根项目 ``liorium``（12 个 workspace 成员的源码被 force-include 打进
+发布单元只有一个：根项目 ``liorium``（13 个 workspace 成员的源码被 force-include 打进
 同一个 wheel）。因此版本号只有一个真正生效的地方 —— 根 ``pyproject.toml`` ——
 外加 ``src/liorium/__init__.py`` 里的 ``__version__`` 必须与它相同。
 
 用法::
 
     python scripts/check_version.py v0.1.0          # 只查「发布单元」
-    python scripts/check_version.py v0.1.0 --all    # 再加查 12 个 workspace 成员是否漂移
+    python scripts/check_version.py v0.1.0 --all    # 再加查 13 个 workspace 成员是否漂移
 
 退出码非 0 表示版本不一致（构建阶段就应该失败，绝不发一个版本号对不上的包）。
 """
@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--all",
         action="store_true",
-        help="额外检查 12 个 workspace 成员包的版本（它们不发布，但保持同步更省心）",
+        help="额外检查 13 个 workspace 成员包的版本（它们不发布，但保持同步更省心）",
     )
     args = parser.parse_args(argv)
 

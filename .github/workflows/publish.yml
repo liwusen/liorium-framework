@@ -2,8 +2,8 @@ name: Publish to PyPI
 
 # Trusted Publishing（OIDC）：仓库里没有任何 PyPI token / secret。
 #
-# 发布单元只有一个发行版 liorium —— 12 个模块（core / vfs / realm_base / core_tool /
-# core_tool_realm / agent / memory / skills / mcp / todo_realm / provider / cli）的源码由
+# 发布单元只有一个发行版 liorium —— 13 个模块（core / vfs / realm_base / core_tool /
+# core_tool_realm / agent / memory / skills / mcp / todo_realm / provider / profile / cli）的源码由
 # 根 pyproject.toml 的 force-include 打进同一个 wheel。因此 PyPI 侧只需要**一条**配置：
 #
 #   PyPI Project Name: liorium
@@ -38,7 +38,7 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 1. 构建：一个 sdist + 一个 wheel（内含 12 个模块）
+  # 1. 构建：一个 sdist + 一个 wheel（内含 13 个模块）
   # ---------------------------------------------------------------------------
   build:
     name: build liorium
@@ -79,7 +79,7 @@ jobs:
   publish:
     name: publish liorium
     needs: build
-    # build-only：只验证能构建 + 元数据合法 + 12 个模块齐全，不碰 PyPI
+    # build-only：只验证能构建 + 元数据合法 + 13 个模块齐全，不碰 PyPI
     if: github.event_name != 'workflow_dispatch' || inputs.target != 'build-only'
     runs-on: ubuntu-latest
     environment:

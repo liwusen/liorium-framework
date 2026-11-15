@@ -36,7 +36,7 @@ worker 裁决（``runtime/worker.py``），``EventHub`` 负责永不阻塞的扇
 
 from __future__ import annotations
 
-__version__ = "0.1.1"
+__version__ = "0.3.0"
 
 from .agent import LioriumAgent
 from .context import ContextChannel

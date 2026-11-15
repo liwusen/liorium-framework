@@ -8,7 +8,7 @@ Liorium 只发布**一个**发行版：`liorium`。13 个模块（`core` / `vfs`
 工作流：[`.github/workflows/publish.yml`](../.github/workflows/publish.yml)
 
 ```
-tag v0.1.1 ──▶ build（1 个 sdist + 1 个 wheel，内含 13 个模块
+tag v0.3.0 ──▶ build（1 个 sdist + 1 个 wheel，内含 13 个模块
                     + twine check + check_wheel 验模块齐全）
             └▶ publish（OIDC 换一次性上传凭证，1 条 publisher）
                └▶ release（把 sdist/wheel 挂到 GitHub Release）
@@ -58,8 +58,8 @@ TestPyPI 与 PyPI 是两套独立登记，配与不配都不影响正式发布�
 
 ```bash
 # 两处都改成 0.1.0 之后
-git commit -am "release: v0.1.1"
-git tag v0.1.1
+git commit -am "release: v0.3.0"
+git tag v0.3.0
 git push origin main --tags
 ```
 
@@ -73,7 +73,7 @@ git push origin main --tags
 
 ```powershell
 # 版本一致性（--all 顺便查 13 个 workspace 成员有没有漂）
-uv run --no-project python scripts/check_version.py v0.1.1 --all
+uv run --no-project python scripts/check_version.py v0.3.0 --all
 
 # 构建 1 个 sdist + 1 个 wheel，并检查元数据与模块齐全
 uv build --out-dir dist
@@ -94,7 +94,7 @@ uv run --no-project python -c "import liorium, liorium.agent, liorium.cli; print
 
 - 源码仍按 `packages/<包名>/src/liorium/<子包>` 分目录维护：依赖方向、单元测试、
   `tests/test_architecture.py` 的架构守卫都按模块边界工作，改动面小。
-- 发布时由根 `pyproject.toml` 的 `force-include` 把 12 棵树注入同一个 wheel，
+- 发布时由根 `pyproject.toml` 的 `force-include` 把 13 棵树注入同一个 wheel，
   wheel 里就是 `liorium/{core,vfs,agent,...}`，**import 路径与开发时完全一致**。
 - 第三方依赖靠 extra 分档（`[all]` / `[mcp]` / `[vector]` / `[openai]` / `[anthropic]` /
   `[google]` / `[images]`）；`core` 与 `vfs` 的**代码**仍然零第三方依赖

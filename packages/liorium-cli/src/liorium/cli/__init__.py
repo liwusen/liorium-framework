@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Sequence
 
-__version__ = "0.1.1"
+__version__ = "0.3.0"
 
 
 def main(argv: Sequence[str] | None = None) -> int:
